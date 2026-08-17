@@ -25,7 +25,8 @@ ASR-XGBoost 最小演示版 (Minimal Demo) —— 多情形模拟研究
                     与论文敏感性分析一致）；
                     小区域按质心最近邻合并（对应行政分块 strategy B 小国合并）
   - 划分:          7:2:1 训练/验证/测试（与论文协议一致）；测试集不参与任何选择
-  - 评估:          测试集 AUC/Brier/平滑度 + final 式空间 CV（3×3 网格块折，
+  - 评估:          测试集 AUC/Brier/LogLoss + 空间指标（Moran's I/ContED/Iso ratio，
+                   与论文口径一致） + final 式空间 CV（3×3 网格块折，
                    块不跨折；每折重训 CE 并重算软标签/门控，无泄漏；
                    ASR 在 CV 内用训练侧预选 λ*，与测试集口径一致）
 
@@ -285,14 +286,51 @@ def recall_score(y, p, thr=0.5):
     return tp / (tp + fn) if (tp + fn) > 0 else 0.0
 
 
-def smoothness(p_grid):
-    s = np.zeros_like(p_grid)
+def spatial_metrics(p, land_mask=None):
+    """论文口径的三个空间平滑度指标（与 CHIKV 论文 Spatial Smoothness Metrics 一致）：
+    Moran's I（4 邻域自相关）、ContED（4 邻域平均边缘强度）、
+    Iso ratio（|p_i − 8 邻域均值| > 0.05 的孤立像元比例）。
+    land_mask 可选：只统计陆地像元（邻对两端均须在陆地内）。"""
+    p = np.asarray(p, dtype=float)
+    n = p.shape[0]
+    m = np.ones_like(p, dtype=bool) if land_mask is None else land_mask.astype(bool)
+    # 4 邻域有效对（水平右邻 + 垂直下邻，避免重复计数；两端均在陆地）
+    h_ok = m[:, :-1] & m[:, 1:]
+    v_ok = m[:-1, :] & m[1:, :]
+    pi_h, pj_h = p[:, :-1][h_ok], p[:, 1:][h_ok]
+    pi_v, pj_v = p[:-1, :][v_ok], p[1:, :][v_ok]
+    pi = np.concatenate([pi_h, pi_v])
+    pj = np.concatenate([pj_h, pj_v])
+    if len(pi) == 0:
+        return 0.0, 0.0, 0.0
+    # ContED：相邻对绝对差均值
+    conted = float(np.mean(np.abs(pi - pj)))
+    # Moran's I：z 相对陆地均值
+    p_land = p[m]
+    z = p - p_land.mean()
+    num = float(np.sum(z[:, :-1][h_ok] * z[:, 1:][h_ok])
+                + np.sum(z[:-1, :][v_ok] * z[1:, :][v_ok]))
+    denom = float(np.sum(z[m] ** 2))
+    s0 = float(h_ok.sum() + v_ok.sum())
+    moran = (int(m.sum()) / s0) * (num / denom) if (denom > 0 and s0 > 0) else 0.0
+    # Iso ratio：|p_i − 8 邻域均值| > 0.05 的陆地像元占比
+    # 邻域用切片实现（边界外不算邻域，无 np.roll 卷绕伪影）；只统计陆地邻域
+    nb_sum = np.zeros_like(p)
+    nb_cnt = np.zeros_like(p, dtype=float)
+    pm = np.where(m, p, 0.0)
     for dy in (-1, 0, 1):
         for dx in (-1, 0, 1):
             if dx == 0 and dy == 0:
                 continue
-            s += np.roll(p_grid, (dy, dx), axis=(0, 1))
-    return float(np.mean(np.abs(p_grid - s / 8.0)))
+            s_r0, s_r1 = max(0, dy), min(n, n + dy)
+            d_r0, d_r1 = max(0, -dy), min(n, n - dy)
+            s_c0, s_c1 = max(0, dx), min(n, n + dx)
+            d_c0, d_c1 = max(0, -dx), min(n, n - dx)
+            nb_sum[d_r0:d_r1, d_c0:d_c1] += pm[s_r0:s_r1, s_c0:s_c1]
+            nb_cnt[d_r0:d_r1, d_c0:d_c1] += m[s_r0:s_r1, s_c0:s_c1]
+    nb_mean = np.divide(nb_sum, nb_cnt, out=np.zeros_like(p), where=nb_cnt > 0)
+    iso = float(np.mean(np.abs(p[m] - nb_mean[m]) > 0.05))
+    return moran, conted, iso
 
 
 # ==========================================================================
@@ -477,6 +515,7 @@ def simulate_once(gname, pname, seed, n, nblocks, min_pixels, lam_grid,
     # 按 sample_frac（默认 40%）采样像元作为数据集（模拟观测稀疏），再在数据集内 7:2:1 划分
     land_idx = np.flatnonzero(np.ones(n * n, bool) if ocean is None
                               else ~ocean.ravel())
+    land_mask = np.ones((n, n), dtype=bool) if ocean is None else ~ocean
     n_ds = int(sample_frac * len(land_idx))
     ds = land_idx if sample_frac >= 1.0 else rng.choice(land_idx, size=n_ds, replace=False)
     idx = rng.permutation(ds)
@@ -533,9 +572,10 @@ def simulate_once(gname, pname, seed, n, nblocks, min_pixels, lam_grid,
                n=n, soft=soft, delta=delta, Xall=Xall, trva=trva)
     out['test'] = {}
     for name, p in [('CE', p_ce), ('ASRg', p_asr_g), ('ASRb', p_asr_b)]:
+        moran, conted, iso = spatial_metrics(p.reshape(n, n), land_mask)
         out['test'][name] = (auc_score(y[te], p[te]),
                              brier_score(y[te], p[te]),
-                             smoothness(p.reshape(n, n)),   # 全图预测面平滑度（三模型同口径）
+                             moran, conted, iso,
                              logloss_score(y[te], p[te]),
                              recall_score(y[te], p[te]))
     out['n_land'] = len(land_idx)
@@ -836,8 +876,8 @@ def run_study(args, lam_grid):
     print('测试集指标（7:2:1 划分，ASR 用训练侧分块 λ*；mean±std）:')
     print(f'{"指标":<10}{"CE":<24}{"SR(λ=1.0)":<26}{"ASR":<14}')
     agg = {}
-    for mname, idx in [('AUC', 0), ('Brier', 1), ('LogLoss', 3),
-                       ('平滑度', 2)]:
+    for mname, idx in [('AUC', 0), ('Brier', 1), ('LogLoss', 5),
+                       ("Moran's I", 2), ('Cont. ed.', 3), ('Iso ratio', 4)]:
         row = f'{mname:<10}'
         for m in ('CE', 'ASRg', 'ASRb'):
             vals = [r['test'][m][idx] for r in results]
@@ -858,7 +898,7 @@ def run_study(args, lam_grid):
             row += f'{np.mean(vals):.4f}±{np.std(vals):.4f}  '
         print(row)
     print('-' * 74)
-    for mname in ('AUC', 'Brier', 'LogLoss', '平滑度'):
+    for mname in ('AUC', 'Brier', 'LogLoss', "Moran's I", 'Cont. ed.', 'Iso ratio'):
         d = np.mean(agg['ASR'][mname] - agg['CE'][mname])
         print(f'平均改善 (ASR − CE, 测试集): Δ{mname} {d:+.4f}')
     for mname in ('AUC', 'Brier', 'LogLoss'):
@@ -912,8 +952,8 @@ def run_study(args, lam_grid):
     from scipy import stats
     print(f'配对显著性（每模拟 Δ = ASR − CE；配对 t 与 Wilcoxon 符号秩，n={len(results)}）:')
     for src, key, mlist, asr_key in (
-            ('测试集', 'test', [('AUC', 0), ('Brier', 1), ('LogLoss', 3),
-                                ('平滑度', 2)], 'ASRb'),
+            ('测试集', 'test', [('AUC', 0), ('Brier', 1), ('LogLoss', 5),
+                                ("Moran's I", 2), ('Cont. ed.', 3), ('Iso ratio', 4)], 'ASRb'),
             ('空间CV', 'cv', [('AUC', 1), ('Brier', 0), ('LogLoss', 2)], 'ASR')):
         for mname, idx in mlist:
             d = np.array([r[key][asr_key][idx] - r[key]['CE'][idx] for r in results])
