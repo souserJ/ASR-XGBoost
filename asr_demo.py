@@ -993,6 +993,21 @@ def run_study(args, lam_grid):
                 row += f'{a:.4f}/{b:.4f}  '
             print(row)
     print('-' * 74)
+    print('按 生成 分档精度（跨 3 分块 × 10 种子；每格 CE / SR(λ=1.0) / ASR）:')
+    hdr = f'{"生成":<10}'
+    for col, key, idx in (('AUC(CV)', 'cv', 1), ('Brier(CV)', 'cv', 0),
+                          ('LogLoss(CV)', 'cv', 2), ('Iso(test)', 'test', 4)):
+        hdr += f'{col:<28}'
+    print(hdr)
+    for gname in gens:
+        rs = [r for r in results if r['gname'] == gname]
+        row = f'{gname:<10}'
+        for col, key, idx in (('AUC(CV)', 'cv', 1), ('Brier(CV)', 'cv', 0),
+                              ('LogLoss(CV)', 'cv', 2), ('Iso(test)', 'test', 4)):
+            ms = ('CE', 'SR(λ=1.0)', 'ASR') if key == 'cv' else ('CE', 'ASRg', 'ASRb')
+            row += '/'.join(f'{np.mean([r[key][m][idx] for r in rs]):.4f}' for m in ms).ljust(28)
+        print(row)
+    print('-' * 74)
     # λ* 选择分布（训练侧块内 CV，对应行政 λ 选择口径）
     from collections import Counter
     cnt = Counter()
