@@ -822,8 +822,10 @@ def run_study(args, lam_grid):
         try:
             with open(cache_path, 'rb') as f:
                 cache = pickle.load(f)
-            cache = {k: v for k, v in cache.items() if k.startswith(CACHE_VERSION + '|')}
-            print(f'[Cache] 加载 {len(cache)} 条缓存: {cache_path}')
+            # 仅复用当前版本（v2）的条目；旧版本条目保留在文件中不删除，
+            # 避免写回时无谓覆盖丢失（版本不兼容时 key 自然不匹配，不会误用）
+            n_ok = sum(1 for k in cache if k.startswith(CACHE_VERSION + '|'))
+            print(f'[Cache] 加载 {len(cache)} 条（当前版本可复用 {n_ok} 条）: {cache_path}')
         except Exception:
             cache = {}
             print('[Cache] 缓存读取失败，忽略并重跑')
