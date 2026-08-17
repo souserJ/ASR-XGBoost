@@ -21,12 +21,14 @@ ASR-XGBoost 最小演示版 (Minimal Demo) —— 多情形模拟研究
   - ASR 损失:      L = L_CE + λ_i·δ(p̂)·(p − ṗ)² ,  冻结门控 δ(p̂) = 1 − 2|p̂ − 0.5|
   - 软标签:        ṗ_i = Σ_j w_ij·p̂_j / Σ_j w_ij ,  w_ij = exp(−β·(R_i+R_j)/2)
   - 分块自适应 λ:  每块在块内 k 折交叉验证上按 Brier 均值网格搜索 λ*，
-                    λ 候选范围 0.5~3.5（与论文敏感性分析一致）；
+                    λ 候选范围 0~3.5（默认 0,0.5,...,3.5；λ=0 即无正则化等价 CE，
+                    与论文敏感性分析一致）；
                     小区域按质心最近邻合并（对应行政分块 strategy B 小国合并）
   - 划分:          7:2:1 训练/验证/测试（与论文协议一致）；测试集不参与任何选择
   - 评估:          测试集 AUC/Brier/平滑度 + final 式空间 CV（3×3 网格块折，
                    块不跨折；每折重训 CE 并重算软标签/门控，无泄漏；
-                   ASR 自适应在 CV 内按测试块选 λ*）
+                   ASR 在 CV 内默认用训练侧预选 λ*（公平版），可选
+                   --cv-asr oracle 复刻 final 的测试块选 λ 口径）
 
 模拟研究（--study）:
   默认全块高噪声生成（g_noisy2，--gens 可换其他），
@@ -35,7 +37,7 @@ ASR-XGBoost 最小演示版 (Minimal Demo) —— 多情形模拟研究
   逐模拟缓存（study_cache.pkl，key 含全部参数；--no-cache 强制重跑）。
 
 运行:
-  python asr_demo.py                          # 单次详细演示（200×200, 12 块）
+  python asr_demo.py                          # 单次详细演示（300×300, 16 块）
   python asr_demo.py --study                  # 模拟研究：默认高噪声生成 × 3 分块 × 2 种子（逐模拟缓存）
   python asr_demo.py --blocks regions.npy     # 用 draw_regions.py 自己圈的区域
 依赖:  numpy, xgboost, matplotlib, gstools  (见 requirements.txt)
