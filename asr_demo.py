@@ -676,6 +676,7 @@ def spatial_cv_evaluate(X, y, fit_idx, grid_labels, R, beta, params, num_round,
 # ==========================================================================
 # 6. 主流程
 # ==========================================================================
+CACHE_VERSION = 'v2'   # 缓存结构版本（test 元组含 Moran's I/ContED/Iso ratio 起）；改结构需递增
 def main():
     ap = argparse.ArgumentParser(description='ASR-XGBoost minimal demo')
     ap.add_argument('--beta', type=float, default=2.0)
@@ -821,6 +822,7 @@ def run_study(args, lam_grid):
         try:
             with open(cache_path, 'rb') as f:
                 cache = pickle.load(f)
+            cache = {k: v for k, v in cache.items() if k.startswith(CACHE_VERSION + '|')}
             print(f'[Cache] 加载 {len(cache)} 条缓存: {cache_path}')
         except Exception:
             cache = {}
@@ -832,7 +834,7 @@ def run_study(args, lam_grid):
         for pi, pname in enumerate(parts):
             for rep in range(args.reps):
                 seed = args.seed + rep * 100 + gi * 10 + pi
-                key = (f'{gname}|{pname}|{seed}|{args.seed}|{n}|{args.study_nblocks}|'
+                key = (f'{CACHE_VERSION}|{gname}|{pname}|{seed}|{args.seed}|{n}|{args.study_nblocks}|'
                        f'{args.min_pixels}|{",".join(map(str, lam_grid))}|'
                        f'{args.beta}|{args.cv_folds}|'
                        f'{args.sample}|{",".join(map(str, split))}')
