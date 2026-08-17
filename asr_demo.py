@@ -30,14 +30,14 @@ ASR-XGBoost 最小演示版 (Minimal Demo) —— 多情形模拟研究
                    ASR 在 CV 内用训练侧预选 λ*，与测试集口径一致）
 
 模拟研究（--study）:
-  默认全块高噪声生成（g_noisy2，--gens 可换其他），
+  默认三档难度生成（g_clean 简单 / g_mid 中等 / g_hard 困难，--gens 可换），
   多种分块方式 × 多个种子重复，每次模拟计算精度，
   最后求全部模拟的平均精度（mean±std），同时报告测试集与空间 CV 两套指标；
   逐模拟缓存（study_cache.pkl，key 含全部参数；--no-cache 强制重跑）。
 
 运行:
   python asr_demo.py                          # 单次详细演示（300×300, 16 块）
-  python asr_demo.py --study                  # 模拟研究：默认高噪声生成 × 3 分块 × 2 种子（逐模拟缓存）
+  python asr_demo.py --study                  # 模拟研究：三档难度 × 3 分块 × 2 种子（逐模拟缓存）
   python asr_demo.py --blocks regions.npy     # 用 draw_regions.py 自己圈的区域
 依赖:  numpy, xgboost, matplotlib, gstools  (见 requirements.txt)
 
@@ -397,6 +397,9 @@ GENERATIONS = {
     'g_clean':   dict(name='伯努利·低噪声', mode='bernoulli',
                       noise_base=0.02, noise_diff=0.22, ridge=3.0, len_scale=18.0,
                       frag=1.5, ocean=True),
+    'g_mid':     dict(name='伯努利·中等噪声', mode='bernoulli',
+                      noise_base=0.22, noise_diff=0.02, ridge=3.0, len_scale=18.0,
+                      frag=0.0, ocean=True),
     'g_noisy':   dict(name='伯努利·高漏报异质性', mode='bernoulli',
                       noise_base=0.05, noise_diff=0.30, ridge=3.0, len_scale=18.0,
                       frag=1.5, ocean=True),
@@ -655,9 +658,9 @@ def main():
     ap.add_argument('--num-round', type=int, default=150)
     # 模拟研究
     ap.add_argument('--study', action='store_true', help='运行多情形模拟研究')
-    ap.add_argument('--gens', default='g_noisy2',
-                    help='模拟研究的数据生成列表（默认全块高噪声 g_noisy2；'
-                         '可用 g_clean,g_noisy,g_barrier,g_lgcp 等，逗号分隔）')
+    ap.add_argument('--gens', default='g_clean,g_mid,g_hard',
+                    help='模拟研究的数据生成列表（默认三档难度：g_clean 简单 / g_mid 中等 / '
+                         'g_hard 困难；可加 g_noisy,g_noisy2,g_barrier,g_lgcp，逗号分隔）')
     ap.add_argument('--parts', default='p_voronoi,p_grid,p_resist')
     ap.add_argument('--reps', type=int, default=2, help='每个组合的重复种子数')
     ap.add_argument('--study-grid', type=int, default=100)
