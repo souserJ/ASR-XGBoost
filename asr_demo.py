@@ -381,8 +381,16 @@ def predict_prob(bst, dmatrix):
     return 1.0 / (1.0 + np.exp(-bst.predict(dmatrix, output_margin=True)))
 
 
+def feval_brier(preds, dtrain):
+    """自定义目标模型的早停指标：验证集 Brier（preds 为 margin）。"""
+    p = 1.0 / (1.0 + np.exp(-preds))
+    y = dtrain.get_label()
+    return 'brier', float(np.mean((p - y) ** 2)), False
+
+
 def select_lambda_per_block(X, y, tr_idx, lab_tr, soft, delta, lam_grid,
-                            params, num_round, nfold=5, rule='1se'):
+                            params, num_round, nfold=5, rule='1se',
+                            early_stop=50):
     """分块自适应 λ 选择：块内 nfold 折 CV，按平均 Brier 网格搜索 λ*。
 
     rule='min': 取 CV Brier 最小的 λ（平曲线上可能随机落在端点）
@@ -410,6 +418,9 @@ def select_lambda_per_block(X, y, tr_idx, lab_tr, soft, delta, lam_grid,
                 obj = make_asr_objective(delta[tr_f], soft[tr_f], lam)
                 bst = xgb.train(params, xgb.DMatrix(X[tr_f], label=y[tr_f]),
                                 num_boost_round=num_round, obj=obj,
+                                feval=feval_brier,
+                                evals=[(xgb.DMatrix(X[va_f], label=y[va_f]), 'val')],
+                                early_stopping_rounds=early_stop,
                                 verbose_eval=False)
                 pv = predict_prob(bst, xgb.DMatrix(X[va_f]))
                 briers.append(brier_score(y[va_f], pv))
@@ -463,7 +474,7 @@ PARTITIONS = {
 def simulate_once(gname, pname, seed, n, nblocks, min_pixels, lam_grid,
                   beta, params, num_round, cv_rounds, cv_folds,
                   custom_blocks=None, verbose=False, split=(0.7, 0.2, 0.1),
-                  sample_frac=0.4):
+                  sample_frac=0.4, early_stop=50):
     """一次完整模拟：生成 → 分块 → CE → 软标签/门控 → λ*(块内CV) →
     ASR全局/分块 → 测试集评估。返回 metrics dict（不打印）。"""
     rng = np.random.default_rng(seed)
@@ -527,13 +538,16 @@ def simulate_once(gname, pname, seed, n, nblocks, min_pixels, lam_grid,
     trva = np.concatenate([tr, va])
     Xall = np.column_stack([X1.ravel(), X2.ravel(), X3.ravel()])
 
-    dtrva = xgb.DMatrix(Xall[trva], label=y[trva])
+    dtr = xgb.DMatrix(Xall[tr], label=y[tr])
+    dva = xgb.DMatrix(Xall[va], label=y[va])
     dgrid = xgb.DMatrix(Xall)
 
-    # CE 基线
+    # CE 基线（tr 训练 + va 早停）
     if verbose:
-        print(f'  >> 训练 CE 基线（{num_round} 轮）…', flush=True)
-    bst_ce = xgb.train(params, dtrva, num_boost_round=num_round, verbose_eval=False)
+        print(f'  >> 训练 CE 基线（≤{num_round} 轮，va 早停）…', flush=True)
+    bst_ce = xgb.train(params, dtr, num_boost_round=num_round,
+                       evals=[(dva, 'val')], early_stopping_rounds=early_stop,
+                       verbose_eval=False)
     p_ce = bst_ce.predict(dgrid)
 
     # 软标签（连通性加权）与冻结门控
@@ -541,27 +555,30 @@ def simulate_once(gname, pname, seed, n, nblocks, min_pixels, lam_grid,
     soft = soft_labels_8nn(p_ce_grid, R, beta, connectivity=True).ravel()
     delta = gate_frozen(p_ce)
 
-    # ASR 全局 λ
-    obj_g = make_asr_objective(delta[trva], soft[trva], 1.0)
-    bst_g = xgb.train(params, dtrva, num_boost_round=num_round,
-                      obj=obj_g, verbose_eval=False)
+    # ASR 全局 λ（自定义目标，Brier 早停）
+    obj_g = make_asr_objective(delta[tr], soft[tr], 1.0)
+    bst_g = xgb.train(params, dtr, num_boost_round=num_round, obj=obj_g,
+                      feval=feval_brier, evals=[(dva, 'val')],
+                      early_stopping_rounds=early_stop, verbose_eval=False)
     p_asr_g = predict_prob(bst_g, dgrid)
 
-    # 分块自适应 λ（块内 CV）
+    # 分块自适应 λ（块内 CV，每折早停）
     lab_tr = labels.ravel()[tr]
     if verbose:
         print(f'  >> 分块 λ 选择（{n_blk} 块 × {len(lam_grid)} 个 λ × '
-              f'{cv_folds} 折 CV）…', flush=True)
+              f'{cv_folds} 折 CV，≤{cv_rounds} 轮早停）…', flush=True)
     lam_star, cv_rows, cv_curves = select_lambda_per_block(
-        Xall, y, tr, lab_tr, soft, delta, lam_grid, params, cv_rounds, cv_folds)
+        Xall, y, tr, lab_tr, soft, delta, lam_grid, params, cv_rounds, cv_folds,
+        early_stop=early_stop)
     lam_map = np.full(n * n, 1.0)
     for b, l in lam_star.items():
         lam_map[labels.ravel() == b] = l
 
     # ASR 分块自适应 λ
-    obj_b = make_asr_objective(delta[trva], soft[trva], lam_map[trva])
-    bst_b = xgb.train(params, dtrva, num_boost_round=num_round,
-                      obj=obj_b, verbose_eval=False)
+    obj_b = make_asr_objective(delta[tr], soft[tr], lam_map[tr])
+    bst_b = xgb.train(params, dtr, num_boost_round=num_round, obj=obj_b,
+                      feval=feval_brier, evals=[(dva, 'val')],
+                      early_stopping_rounds=early_stop, verbose_eval=False)
     p_asr_b = predict_prob(bst_b, dgrid)
 
     # 测试集评估
@@ -615,7 +632,8 @@ def build_spatial_folds(block_ids, y, n_folds=5, min_samples=10, seed=42):
 
 
 def spatial_cv_evaluate(X, y, fit_idx, grid_labels, R, beta, params, num_round,
-                        lam_map, n_folds=5, min_samples=10, fold_seed=42):
+                        lam_map, n_folds=5, min_samples=10, fold_seed=42,
+                        early_stop=50):
     """final 式空间 CV（3×3 网格块折，块不跨折，无效块点只进训练）。
 
     每折：折内训练集重训 CE → 全图重算软标签/门控（无泄漏）→
@@ -634,8 +652,16 @@ def spatial_cv_evaluate(X, y, fit_idx, grid_labels, R, beta, params, num_round,
         if len(test_pts) == 0:
             continue
         train_pts = fit_idx[point_fold != f]             # 含无效块点
-        dtr = xgb.DMatrix(X[train_pts], label=y[train_pts])
+        # 折内再切 15% 做早停 va（无泄漏，固定种子可复现）
+        rng_f = np.random.default_rng(fold_seed + f)
+        perm_f = rng_f.permutation(len(train_pts))
+        n_va_f = max(1, int(0.15 * len(train_pts)))
+        va_pts = train_pts[perm_f[:n_va_f]]
+        tr_pts = train_pts[perm_f[n_va_f:]]
+        dtr = xgb.DMatrix(X[tr_pts], label=y[tr_pts])
+        dva = xgb.DMatrix(X[va_pts], label=y[va_pts])
         bst_ce = xgb.train(params, dtr, num_boost_round=num_round,
+                           evals=[(dva, 'val')], early_stopping_rounds=early_stop,
                            verbose_eval=False)
         p_ce_full = bst_ce.predict(dX)                   # 全栅格预测
         soft_f = soft_labels_8nn(p_ce_full.reshape(n, n), R, beta).ravel()
@@ -643,15 +669,17 @@ def spatial_cv_evaluate(X, y, fit_idx, grid_labels, R, beta, params, num_round,
         y_te = y[test_pts]
         p_ce_te = p_ce_full[test_pts]
         # SR(λ=1.0)：固定强度
-        obj = make_asr_objective(delta_f[train_pts], soft_f[train_pts], 1.0)
+        obj = make_asr_objective(delta_f[tr_pts], soft_f[tr_pts], 1.0)
         bst = xgb.train(params, dtr, num_boost_round=num_round, obj=obj,
-                        verbose_eval=False)
+                        feval=feval_brier, evals=[(dva, 'val')],
+                        early_stopping_rounds=early_stop, verbose_eval=False)
         p_sr10_te = predict_prob(bst, dX)[test_pts]
         # ASR：训练侧预选 λ*（逐像元，公平版）
-        obj = make_asr_objective(delta_f[train_pts], soft_f[train_pts],
-                                 lam_map[train_pts])
+        obj = make_asr_objective(delta_f[tr_pts], soft_f[tr_pts],
+                                 lam_map[tr_pts])
         bst = xgb.train(params, dtr, num_boost_round=num_round, obj=obj,
-                        verbose_eval=False)
+                        feval=feval_brier, evals=[(dva, 'val')],
+                        early_stopping_rounds=early_stop, verbose_eval=False)
         p_asr_te = predict_prob(bst, dX)[test_pts]
         per_fold['CE'].append((brier_score(y_te, p_ce_te),
                                auc_score(y_te, p_ce_te),
@@ -676,7 +704,7 @@ def spatial_cv_evaluate(X, y, fit_idx, grid_labels, R, beta, params, num_round,
 # ==========================================================================
 # 6. 主流程
 # ==========================================================================
-CACHE_VERSION = 'v2'   # 缓存结构版本（test 元组含 Moran's I/ContED/Iso ratio 起）；改结构需递增
+CACHE_VERSION = 'v3'   # 缓存结构版本（v3: tr 训练 + va 早停协议）；改结构需递增
 def main():
     ap = argparse.ArgumentParser(description='ASR-XGBoost minimal demo')
     ap.add_argument('--beta', type=float, default=2.0)
@@ -695,8 +723,12 @@ def main():
     ap.add_argument('--lam-grid', default='0,0.5,1,1.5,2,2.5,3,3.5',
                     help='λ 候选：0（无正则化，等价 CE）至 3.5（论文敏感性分析上限）')
     ap.add_argument('--cv-folds', type=int, default=5)
-    ap.add_argument('--cv-rounds', type=int, default=100)
-    ap.add_argument('--num-round', type=int, default=150)
+    ap.add_argument('--cv-rounds', type=int, default=1000,
+                    help='λ 选择块内 CV 的轮数上限（配合早停）')
+    ap.add_argument('--num-round', type=int, default=1000,
+                    help='主训练轮数上限（配合 va 早停，实际轮数自动选择，与论文 1000 树一致）')
+    ap.add_argument('--early-stop', type=int, default=50,
+                    help='早停耐心轮数（验证集指标连续不改善则停止）')
     # 模拟研究
     ap.add_argument('--study', action='store_true', help='运行多情形模拟研究')
     ap.add_argument('--gens', default='g_clean,g_mid,g_hard',
@@ -722,7 +754,8 @@ def main():
                              subsample=0.8, colsample_bytree=0.8, seed=args.seed),
                         args.num_round, args.cv_rounds, args.cv_folds,
                         custom_blocks=(np.load(args.blocks) if args.blocks else None),
-                        verbose=True, split=split, sample_frac=args.sample)
+                        verbose=True, split=split, sample_frac=args.sample,
+                        early_stop=args.early_stop)
     n = out['n']
     n_land = out['n_land']
     n_tr, n_va, n_te = out['n_split']
@@ -752,7 +785,8 @@ def main():
                                            max_depth=4, subsample=0.8,
                                            colsample_bytree=0.8, seed=args.seed),
                                       args.num_round, out['lam_map'],
-                                      n_folds=args.cv_folds)
+                                      n_folds=args.cv_folds,
+                                      early_stop=args.early_stop)
     print(f'空间 CV（3×3 网格块折，{args.cv_folds} 折，mean±std，唯一评估方式）:')
     print(f'{"指标":<10}{"CE":<24}{"SR(λ=1.0)":<26}{"ASR":<14}')
     for mname, idx in [('AUC', 1), ('Brier', 0), ('LogLoss', 2)]:
@@ -846,14 +880,18 @@ def run_study(args, lam_grid):
                 else:
                     out = simulate_once(gname, pname, seed, n, args.study_nblocks,
                                         args.min_pixels, lam_grid, args.beta,
-                                        params, 60, 40, args.cv_folds,
-                                        split=split, sample_frac=args.sample)
+                                        params, args.num_round, args.cv_rounds,
+                                        args.cv_folds,
+                                        split=split, sample_frac=args.sample,
+                                        early_stop=args.early_stop)
                     # final 式空间 CV（3×3 网格块折，每折重训+重算软标签，无泄漏）
                     glab = grid_blocks(out['n'], 3).ravel()
                     pf, pts = spatial_cv_evaluate(out['Xall'], out['y'], out['trva'], glab,
-                                                  out['R'], args.beta, params, 60,
+                                                  out['R'], args.beta, params,
+                                                  args.num_round,
                                                   out['lam_map'],
-                                                  n_folds=args.cv_folds)
+                                                  n_folds=args.cv_folds,
+                                                  early_stop=args.early_stop)
                     out['cv'] = {m: np.asarray(pf[m]).mean(axis=0)
                                  for m in ('CE', 'SR(λ=1.0)', 'ASR')}
                     out['cv_pts'] = {k: np.concatenate(v) for k, v in pts.items()}
