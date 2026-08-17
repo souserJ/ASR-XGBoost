@@ -27,8 +27,7 @@ ASR-XGBoost 最小演示版 (Minimal Demo) —— 多情形模拟研究
   - 划分:          7:2:1 训练/验证/测试（与论文协议一致）；测试集不参与任何选择
   - 评估:          测试集 AUC/Brier/平滑度 + final 式空间 CV（3×3 网格块折，
                    块不跨折；每折重训 CE 并重算软标签/门控，无泄漏；
-                   ASR 在 CV 内默认用训练侧预选 λ*（公平版），可选
-                   --cv-asr oracle 复刻 final 的测试块选 λ 口径）
+                   ASR 在 CV 内用训练侧预选 λ*，与测试集口径一致）
 
 模拟研究（--study）:
   默认全块高噪声生成（g_noisy2，--gens 可换其他），
@@ -117,6 +116,7 @@ def gen_labels(p_true, labels, rng, cfg):
         p_occ = 1.0 - np.exp(-lam)
         return (rng.uniform(size=len(p_occ)) < p_occ).astype(float)
     sigma = cfg.get('noise_base', 0.08) + cfg.get('noise_diff', 0.10) * (labels.ravel() % 2)
+    # 注：labels=-1 为海洋像元（numpy 取模得 1，按奇数块噪声），不进数据集，不影响结果
     p_eff = np.clip(p_true.ravel() + rng.normal(0.0, sigma), 0.001, 0.999)
     return (rng.uniform(size=len(p_eff)) < p_eff).astype(float)
 
@@ -471,7 +471,7 @@ def simulate_once(gname, pname, seed, n, nblocks, min_pixels, lam_grid,
 
     y = gen_labels(p_true, labels, rng, gcfg)
 
-    # 采样 20% 像元作为数据集（模拟观测稀疏），再在数据集内 7:2:1 划分
+    # 按 sample_frac（默认 40%）采样像元作为数据集（模拟观测稀疏），再在数据集内 7:2:1 划分
     land_idx = np.flatnonzero(np.ones(n * n, bool) if ocean is None
                               else ~ocean.ravel())
     n_ds = int(sample_frac * len(land_idx))
@@ -532,16 +532,9 @@ def simulate_once(gname, pname, seed, n, nblocks, min_pixels, lam_grid,
     for name, p in [('CE', p_ce), ('ASRg', p_asr_g), ('ASRb', p_asr_b)]:
         out['test'][name] = (auc_score(y[te], p[te]),
                              brier_score(y[te], p[te]),
-                             smoothness(p.reshape(n, n)),
+                             smoothness(p.reshape(n, n)),   # 全图预测面平滑度（三模型同口径）
                              logloss_score(y[te], p[te]),
                              recall_score(y[te], p[te]))
-    # 全量评估：全部陆地像元（含未采样像元，模拟数据均有合成标签）
-    out['full'] = {}
-    for name, p in [('CE', p_ce), ('ASRg', p_asr_g), ('ASRb', p_asr_b)]:
-        out['full'][name] = (auc_score(y[land_idx], p[land_idx]),
-                             brier_score(y[land_idx], p[land_idx]),
-                             logloss_score(y[land_idx], p[land_idx]),
-                             recall_score(y[land_idx], p[land_idx]))
     out['n_land'] = len(land_idx)
     out['n_dataset'] = len(ds)
     out['n_split'] = (len(tr), len(va), len(te))
@@ -578,29 +571,12 @@ def build_spatial_folds(block_ids, y, n_folds=5, min_samples=10, seed=42):
     return point_fold
 
 
-def _interp_at_lambda(A, anchor_lams, lam):
-    """预测矩阵 A（n×k，列 = 锚点 λ 升序）在 lam 处的线性插值预测。"""
-    i = int(np.searchsorted(anchor_lams, lam))
-    if i <= 0:
-        return A[:, 0].copy()
-    if i >= len(anchor_lams):
-        return A[:, -1].copy()
-    l0, l1 = anchor_lams[i - 1], anchor_lams[i]
-    t = (lam - l0) / (l1 - l0)
-    return (1.0 - t) * A[:, i - 1] + t * A[:, i]
-
-
 def spatial_cv_evaluate(X, y, fit_idx, grid_labels, R, beta, params, num_round,
-                        lam_grid, lam_map=None, n_folds=5, min_samples=10,
-                        min_test_block=5, fold_seed=42, dense_step=0.05,
-                        asr_mode='fixed'):
+                        lam_map, n_folds=5, min_samples=10, fold_seed=42):
     """final 式空间 CV（3×3 网格块折，块不跨折，无效块点只进训练）。
 
-    每折：折内训练集重训 CE → 全图重算软标签/门控（无泄漏）。ASR 的 λ 处理：
-      asr_mode='fixed'（默认，公平版）：用训练侧预选 λ*（lam_map 逐像元，
-        与测试集口径一致，无 oracle，不偷看测试块标签）；
-      asr_mode='oracle'：训 λ 谱固定模型 SR(λ)，对每个测试块在谱上按 Brier
-        选 λ*（线性插值，对应 final.py 的 Brent 选择，略乐观）。
+    每折：折内训练集重训 CE → 全图重算软标签/门控（无泄漏）→
+    ASR 用训练侧预选 λ*（lam_map 逐像元，与测试集口径一致，无 oracle）。
     返回 (per_fold, pts)：per_fold 每折 (brier, auc, logloss, recall)；
     pts 收集全部测试折像元的 y/CE/SR/ASR/lam（供子集增益分析）。"""
     block_ids = grid_labels[fit_idx]
@@ -628,37 +604,12 @@ def spatial_cv_evaluate(X, y, fit_idx, grid_labels, R, beta, params, num_round,
         bst = xgb.train(params, dtr, num_boost_round=num_round, obj=obj,
                         verbose_eval=False)
         p_sr10_te = predict_prob(bst, dX)[test_pts]
-        # ASR：公平版（预选 λ*）或 oracle 版（测试块上选 λ*）
-        if asr_mode == 'fixed':
-            obj = make_asr_objective(delta_f[train_pts], soft_f[train_pts],
-                                     lam_map[train_pts])
-            bst = xgb.train(params, dtr, num_boost_round=num_round, obj=obj,
-                            verbose_eval=False)
-            p_asr_te = predict_prob(bst, dX)[test_pts]
-        else:                                            # oracle
-            anchor_lams = np.array([0.0] + sorted(float(v) for v in lam_grid
-                                                  if float(v) > 0.0))
-            dense = np.arange(0.0, anchor_lams[-1] + 1e-9, dense_step)
-            A = np.empty((len(X), len(anchor_lams)))
-            A[:, 0] = p_ce_full                          # λ=0 锚点 = CE
-            for j, lb in enumerate(anchor_lams[1:], start=1):
-                obj = make_asr_objective(delta_f[train_pts], soft_f[train_pts],
-                                         float(lb))
-                bst = xgb.train(params, dtr, num_boost_round=num_round,
-                                obj=obj, verbose_eval=False)
-                A[:, j] = predict_prob(bst, dX)
-            A_te = A[test_pts]
-            p_asr_te = np.empty(len(test_pts))
-            for bid in np.unique(grid_labels[test_pts]):
-                m = grid_labels[test_pts] == bid
-                yy = y_te[m]
-                if len(yy) >= min_test_block and len(np.unique(yy)) >= 2:
-                    bb = np.array([brier_score(yy, _interp_at_lambda(A_te[m], anchor_lams, la))
-                                   for la in dense])
-                    p_asr_te[m] = _interp_at_lambda(A_te[m], anchor_lams,
-                                                    dense[int(np.argmin(bb))])
-                else:
-                    p_asr_te[m] = A_te[m, 0]             # 小/单类块退回 CE
+        # ASR：训练侧预选 λ*（逐像元，公平版）
+        obj = make_asr_objective(delta_f[train_pts], soft_f[train_pts],
+                                 lam_map[train_pts])
+        bst = xgb.train(params, dtr, num_boost_round=num_round, obj=obj,
+                        verbose_eval=False)
+        p_asr_te = predict_prob(bst, dX)[test_pts]
         per_fold['CE'].append((brier_score(y_te, p_ce_te),
                                auc_score(y_te, p_ce_te),
                                logloss_score(y_te, p_ce_te),
@@ -686,7 +637,7 @@ def main():
     ap = argparse.ArgumentParser(description='ASR-XGBoost minimal demo')
     ap.add_argument('--beta', type=float, default=2.0)
     ap.add_argument('--gen', default='g_clean', choices=list(GENERATIONS.keys()),
-                    help='单次演示的数据生成场景（g_noisy 高噪声场景 ASR 收益更明显）')
+                    help='单次演示的数据生成场景（g_hard 弱信号困难场景 ASR 收益更明显）')
     ap.add_argument('--seed', type=int, default=42)
     ap.add_argument('--grid', type=int, default=300, help='模拟栅格边长')
     ap.add_argument('--blocks', default=None, help='regions.npy（draw_regions.py 生成）')
@@ -700,9 +651,6 @@ def main():
     ap.add_argument('--lam-grid', default='0,0.5,1,1.5,2,2.5,3,3.5',
                     help='λ 候选：0（无正则化，等价 CE）至 3.5（论文敏感性分析上限）')
     ap.add_argument('--cv-folds', type=int, default=5)
-    ap.add_argument('--cv-asr', default='fixed', choices=['fixed', 'oracle'],
-                    help='空间 CV 中 ASR 的 λ 处理：fixed=训练侧预选 λ*（公平，默认）/ '
-                         'oracle=测试块上按 Brier 选 λ*（final 口径，略乐观）')
     ap.add_argument('--cv-rounds', type=int, default=100)
     ap.add_argument('--num-round', type=int, default=150)
     # 模拟研究
@@ -751,7 +699,7 @@ def main():
     print('=' * 66)
 
     # final 式空间 CV：3×3 网格块折（对应 5°×5° 惯例），块不跨折；
-    # 每折重训 CE 并重算软标签/门控（无泄漏）；ASR λ 默认用训练侧预选 λ*（公平版）。
+    # 每折重训 CE 并重算软标签/门控（无泄漏）；ASR 用训练侧预选 λ*（公平版）。
     print('>> final 式空间 CV 评估（3×3 网格块折）…', flush=True)
     glab = grid_blocks(n, 3).ravel()
     per_fold, _ = spatial_cv_evaluate(out['Xall'], out['y'], out['trva'], glab,
@@ -759,10 +707,8 @@ def main():
                                       dict(objective='binary:logistic', eta=0.1,
                                            max_depth=4, subsample=0.8,
                                            colsample_bytree=0.8, seed=args.seed),
-                                      args.num_round, lam_grid,
-                                      lam_map=out['lam_map'],
-                                      n_folds=args.cv_folds,
-                                      asr_mode=args.cv_asr)
+                                      args.num_round, out['lam_map'],
+                                      n_folds=args.cv_folds)
     print(f'空间 CV（3×3 网格块折，{args.cv_folds} 折，mean±std，唯一评估方式）:')
     print(f'{"指标":<10}{"CE":<24}{"SR(λ=1.0)":<26}{"ASR":<14}')
     for mname, idx in [('AUC', 1), ('Brier', 0), ('LogLoss', 2)]:
@@ -781,15 +727,15 @@ def main():
 
     fig, axes = plt.subplots(2, 3, figsize=(16, 9))
     p_ce_g = mask(out['p_ce'].reshape(n, n))
-    p_asr_g = mask(out['p_asr_b'].reshape(n, n))
-    diff = p_asr_g - p_ce_g
+    p_asr_map = mask(out['p_asr_b'].reshape(n, n))
+    diff = p_asr_map - p_ce_g
     vmax = float(np.nanmax(np.abs(diff))) or 1.0   # 差值图对称色标，放大差距
     panels = [
         ('True risk', mask(out['p_true']), 'viridis', None),
         ('Blocks (merged)', mask(out['labels']), 'tab10', None),
         ('Lambda* by block', mask(out['lam_map'].reshape(n, n)), 'viridis', None),
         ('CE prediction', p_ce_g, 'viridis', None),
-        ('ASR (block-adaptive)', p_asr_g, 'viridis', None),
+        ('ASR (block-adaptive)', p_asr_map, 'viridis', None),
         ('ASR − CE', diff, 'RdBu_r', (-vmax, vmax)),
     ]
     for ax, (title, data, cmap_name, vrange) in zip(axes.ravel(), panels):
@@ -843,9 +789,9 @@ def run_study(args, lam_grid):
         for pi, pname in enumerate(parts):
             for rep in range(args.reps):
                 seed = args.seed + rep * 100 + gi * 10 + pi
-                key = (f'{gname}|{pname}|{seed}|{n}|{args.study_nblocks}|'
+                key = (f'{gname}|{pname}|{seed}|{args.seed}|{n}|{args.study_nblocks}|'
                        f'{args.min_pixels}|{",".join(map(str, lam_grid))}|'
-                       f'{args.beta}|{args.cv_folds}|{args.cv_asr}|'
+                       f'{args.beta}|{args.cv_folds}|'
                        f'{args.sample}|{",".join(map(str, split))}')
                 if key in cache:
                     out = cache[key]
@@ -858,10 +804,9 @@ def run_study(args, lam_grid):
                     # final 式空间 CV（3×3 网格块折，每折重训+重算软标签，无泄漏）
                     glab = grid_blocks(out['n'], 3).ravel()
                     pf, pts = spatial_cv_evaluate(out['Xall'], out['y'], out['trva'], glab,
-                                                  out['R'], args.beta, params, 60, lam_grid,
-                                                  lam_map=out['lam_map'],
-                                                  n_folds=args.cv_folds,
-                                                  asr_mode=args.cv_asr)
+                                                  out['R'], args.beta, params, 60,
+                                                  out['lam_map'],
+                                                  n_folds=args.cv_folds)
                     out['cv'] = {m: np.asarray(pf[m]).mean(axis=0)
                                  for m in ('CE', 'SR(λ=1.0)', 'ASR')}
                     out['cv_pts'] = {k: np.concatenate(v) for k, v in pts.items()}
@@ -897,8 +842,7 @@ def run_study(args, lam_grid):
             row += f'{np.mean(vals):.4f}±{np.std(vals):.4f}  '
         print(row)
     print('-' * 74)
-    _asr_note = ('ASR 用训练侧预选 λ*（公平版）' if args.cv_asr == 'fixed'
-                 else 'ASR 按测试块选 λ*（oracle，略乐观）')
+    _asr_note = 'ASR 用训练侧预选 λ*（公平版）'
     print('空间 CV（3×3 网格块折，块不跨折，每折重训+重算软标签，'
           f'{_asr_note}；mean±std）:')
     print(f'{"指标":<10}{"CE":<24}{"SR(λ=1.0)":<26}{"ASR":<14}')
