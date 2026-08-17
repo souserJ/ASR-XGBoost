@@ -382,10 +382,32 @@ def predict_prob(bst, dmatrix):
 
 
 def feval_brier(preds, dtrain):
-    """自定义目标模型的早停指标：验证集 Brier（preds 为 margin）。"""
+    """自定义目标模型的早停指标：验证集 Brier（preds 为 margin）。
+    xgboost 1.x feval 返回 (name, value, higher_better)；2.x+ custom_metric 返回 (name, value)。"""
     p = 1.0 / (1.0 + np.exp(-preds))
     y = dtrain.get_label()
-    return 'brier', float(np.mean((p - y) ** 2)), False
+    val = float(np.mean((p - y) ** 2))
+    import xgboost as _xgb
+    ver = tuple(int(x) for x in _xgb.__version__.split('.')[:2])
+    if ver >= (2, 0):
+        return 'brier', val          # custom_metric：越低越好
+    return 'brier', val, False       # feval（1.x）
+
+
+def _xgb_train_es(params, dtr, num_round, dva, early_stop, obj=None):
+    """xgb.train 封装：va 早停。自定义目标时用 Brier 作早停指标，
+    兼容 xgboost 1.x（feval）与 2.x+（custom_metric）。"""
+    import xgboost as _xgb
+    kwargs = dict(num_boost_round=num_round, evals=[(dva, 'val')],
+                  early_stopping_rounds=early_stop, verbose_eval=False)
+    if obj is not None:
+        kwargs['obj'] = obj
+        ver = tuple(int(p) for p in _xgb.__version__.split('.')[:2])
+        if ver >= (2, 0):
+            kwargs['custom_metric'] = feval_brier
+        else:
+            kwargs['feval'] = feval_brier
+    return _xgb.train(params, dtr, **kwargs)
 
 
 def select_lambda_per_block(X, y, tr_idx, lab_tr, soft, delta, lam_grid,
@@ -416,12 +438,9 @@ def select_lambda_per_block(X, y, tr_idx, lab_tr, soft, delta, lam_grid,
                 if len(va_f) == 0:
                     continue
                 obj = make_asr_objective(delta[tr_f], soft[tr_f], lam)
-                bst = xgb.train(params, xgb.DMatrix(X[tr_f], label=y[tr_f]),
-                                num_boost_round=num_round, obj=obj,
-                                feval=feval_brier,
-                                evals=[(xgb.DMatrix(X[va_f], label=y[va_f]), 'val')],
-                                early_stopping_rounds=early_stop,
-                                verbose_eval=False)
+                bst = _xgb_train_es(params, xgb.DMatrix(X[tr_f], label=y[tr_f]),
+                                    num_round, xgb.DMatrix(X[va_f], label=y[va_f]),
+                                    early_stop, obj=obj)
                 pv = predict_prob(bst, xgb.DMatrix(X[va_f]))
                 briers.append(brier_score(y[va_f], pv))
                 aucs.append(auc_score(y[va_f], pv))
@@ -545,9 +564,7 @@ def simulate_once(gname, pname, seed, n, nblocks, min_pixels, lam_grid,
     # CE 基线（tr 训练 + va 早停）
     if verbose:
         print(f'  >> 训练 CE 基线（≤{num_round} 轮，va 早停）…', flush=True)
-    bst_ce = xgb.train(params, dtr, num_boost_round=num_round,
-                       evals=[(dva, 'val')], early_stopping_rounds=early_stop,
-                       verbose_eval=False)
+    bst_ce = _xgb_train_es(params, dtr, num_round, dva, early_stop)
     p_ce = bst_ce.predict(dgrid)
 
     # 软标签（连通性加权）与冻结门控
@@ -557,9 +574,7 @@ def simulate_once(gname, pname, seed, n, nblocks, min_pixels, lam_grid,
 
     # ASR 全局 λ（自定义目标，Brier 早停）
     obj_g = make_asr_objective(delta[tr], soft[tr], 1.0)
-    bst_g = xgb.train(params, dtr, num_boost_round=num_round, obj=obj_g,
-                      feval=feval_brier, evals=[(dva, 'val')],
-                      early_stopping_rounds=early_stop, verbose_eval=False)
+    bst_g = _xgb_train_es(params, dtr, num_round, dva, early_stop, obj=obj_g)
     p_asr_g = predict_prob(bst_g, dgrid)
 
     # 分块自适应 λ（块内 CV，每折早停）
@@ -576,9 +591,7 @@ def simulate_once(gname, pname, seed, n, nblocks, min_pixels, lam_grid,
 
     # ASR 分块自适应 λ
     obj_b = make_asr_objective(delta[tr], soft[tr], lam_map[tr])
-    bst_b = xgb.train(params, dtr, num_boost_round=num_round, obj=obj_b,
-                      feval=feval_brier, evals=[(dva, 'val')],
-                      early_stopping_rounds=early_stop, verbose_eval=False)
+    bst_b = _xgb_train_es(params, dtr, num_round, dva, early_stop, obj=obj_b)
     p_asr_b = predict_prob(bst_b, dgrid)
 
     # 测试集评估
@@ -660,9 +673,7 @@ def spatial_cv_evaluate(X, y, fit_idx, grid_labels, R, beta, params, num_round,
         tr_pts = train_pts[perm_f[n_va_f:]]
         dtr = xgb.DMatrix(X[tr_pts], label=y[tr_pts])
         dva = xgb.DMatrix(X[va_pts], label=y[va_pts])
-        bst_ce = xgb.train(params, dtr, num_boost_round=num_round,
-                           evals=[(dva, 'val')], early_stopping_rounds=early_stop,
-                           verbose_eval=False)
+        bst_ce = _xgb_train_es(params, dtr, num_round, dva, early_stop)
         p_ce_full = bst_ce.predict(dX)                   # 全栅格预测
         soft_f = soft_labels_8nn(p_ce_full.reshape(n, n), R, beta).ravel()
         delta_f = gate_frozen(p_ce_full)
@@ -670,16 +681,12 @@ def spatial_cv_evaluate(X, y, fit_idx, grid_labels, R, beta, params, num_round,
         p_ce_te = p_ce_full[test_pts]
         # SR(λ=1.0)：固定强度
         obj = make_asr_objective(delta_f[tr_pts], soft_f[tr_pts], 1.0)
-        bst = xgb.train(params, dtr, num_boost_round=num_round, obj=obj,
-                        feval=feval_brier, evals=[(dva, 'val')],
-                        early_stopping_rounds=early_stop, verbose_eval=False)
+        bst = _xgb_train_es(params, dtr, num_round, dva, early_stop, obj=obj)
         p_sr10_te = predict_prob(bst, dX)[test_pts]
         # ASR：训练侧预选 λ*（逐像元，公平版）
         obj = make_asr_objective(delta_f[tr_pts], soft_f[tr_pts],
                                  lam_map[tr_pts])
-        bst = xgb.train(params, dtr, num_boost_round=num_round, obj=obj,
-                        feval=feval_brier, evals=[(dva, 'val')],
-                        early_stopping_rounds=early_stop, verbose_eval=False)
+        bst = _xgb_train_es(params, dtr, num_round, dva, early_stop, obj=obj)
         p_asr_te = predict_prob(bst, dX)[test_pts]
         per_fold['CE'].append((brier_score(y_te, p_ce_te),
                                auc_score(y_te, p_ce_te),
