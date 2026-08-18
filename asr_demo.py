@@ -25,7 +25,7 @@ ASR-XGBoost 最小演示版 (Minimal Demo) —— 多情形模拟研究
                     与论文敏感性分析一致）；
                     小区域按质心最近邻合并（对应行政分块 strategy B 小国合并）
   - 划分:          7:2:1 训练/验证/测试（与论文协议一致）；测试集不参与任何选择
-  - 评估:          测试集 AUC/Brier/LogLoss + 空间指标（Moran's I/ContED/Iso ratio，
+  - 评估:          测试集 AUC/Brier/Recall + 空间指标（Moran's I/ContED/Iso ratio，
                    与论文口径一致） + final 式空间 CV（3×3 网格块折，
                    块不跨折；每折重训 CE 并重算软标签/门控，无泄漏；
                    ASR 在 CV 内用训练侧预选 λ*，与测试集口径一致）
@@ -53,6 +53,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import xgboost as xgb
 import gstools as gs
+import unicodedata
 
 # ==========================================================================
 # 1. 模拟数据生成
@@ -331,6 +332,30 @@ def spatial_metrics(p, land_mask=None):
     nb_mean = np.divide(nb_sum, nb_cnt, out=np.zeros_like(p), where=nb_cnt > 0)
     iso = float(np.mean(np.abs(p[m] - nb_mean[m]) > 0.05))
     return moran, conted, iso
+
+
+def _disp_w(s):
+    """终端显示宽度：全角/宽字符（F/W，如中文）计 2 列，其余（含 Ambiguous
+    字符 ± λ ×，等宽字体下按 1 列显示）计 1 列。"""
+    return sum(2 if unicodedata.east_asian_width(c) in ('F', 'W') else 1
+               for c in s)
+
+
+def _pad(s, width):
+    """按终端显示宽度左对齐补齐。"""
+    return s + ' ' * max(0, width - _disp_w(s))
+
+
+def _center(s, width):
+    """按终端显示宽度居中对齐（左补略少于右补）。"""
+    w = _disp_w(s)
+    left = max(0, (width - w) // 2)
+    return ' ' * left + s + ' ' * max(0, width - w - left)
+
+
+def _row(cells, widths):
+    """用 ' | ' 分隔的居中表格行：空格被折叠/字体宽度差异的环境下列结构依然清晰。"""
+    return ' | '.join(_center(str(c), w) for c, w in zip(cells, widths))
 
 
 # ==========================================================================
@@ -795,13 +820,13 @@ def main():
                                       n_folds=args.cv_folds,
                                       early_stop=args.early_stop)
     print(f'空间 CV（3×3 网格块折，{args.cv_folds} 折，mean±std，唯一评估方式）:')
-    print(f'{"指标":<10}{"CE":<24}{"SR(λ=1.0)":<26}{"ASR":<14}')
-    for mname, idx in [('AUC', 1), ('Brier', 0), ('LogLoss', 2)]:
-        row = f'{mname:<10}'
+    print(_row(['指标', 'CE', 'SR(λ=1.0)', 'ASR'], [14, 18, 18, 18]))
+    for mname, idx in [('AUC', 1), ('Brier', 0), ('Recall', 3)]:
+        vals_by_m = []
         for m in ('CE', 'SR(λ=1.0)', 'ASR'):
             vals = [x[idx] for x in per_fold[m]]
-            row += f'{np.mean(vals):.4f}±{np.std(vals):.4f}  '
-        print(row)
+            vals_by_m.append(f'{np.mean(vals):.4f}±{np.std(vals):.4f}')
+        print(_row([mname] + vals_by_m, [14, 18, 18, 18]))
     print('=' * 66)
 
     # 出图（2×3 六联图：真值/分块/λ* + CE/ASR/差值；差值图放大差距，海洋显示为灰色）
@@ -923,34 +948,34 @@ def run_study(args, lam_grid):
           f'{args.reps} 个种子 = {len(results)} 次模拟（跨次平均，等效重复实验）')
     print('-' * 74)
     print('测试集指标（7:2:1 划分，ASR 用训练侧分块 λ*；mean±std）:')
-    print(f'{"指标":<10}{"CE":<24}{"SR(λ=1.0)":<26}{"ASR":<14}')
+    print(_row(['指标', 'CE', 'SR(λ=1.0)', 'ASR'], [14, 18, 18, 18]))
     agg = {}
-    for mname, idx in [('AUC', 0), ('Brier', 1), ('LogLoss', 5),
+    for mname, idx in [('AUC', 0), ('Brier', 1), ('Recall', 6),
                        ("Moran's I", 2), ('Cont. ed.', 3), ('Iso ratio', 4)]:
-        row = f'{mname:<10}'
+        vals_by_m = []
         for m in ('CE', 'ASRg', 'ASRb'):
             vals = [r['test'][m][idx] for r in results]
             agg.setdefault(disp[m], {})[mname] = np.asarray(vals)
-            row += f'{np.mean(vals):.4f}±{np.std(vals):.4f}  '
-        print(row)
+            vals_by_m.append(f'{np.mean(vals):.4f}±{np.std(vals):.4f}')
+        print(_row([mname] + vals_by_m, [14, 18, 18, 18]))
     print('-' * 74)
     _asr_note = 'ASR 用训练侧预选 λ*（公平版）'
     print('空间 CV（3×3 网格块折，块不跨折，每折重训+重算软标签，'
           f'{_asr_note}；mean±std）:')
-    print(f'{"指标":<10}{"CE":<24}{"SR(λ=1.0)":<26}{"ASR":<14}')
+    print(_row(['指标', 'CE', 'SR(λ=1.0)', 'ASR'], [14, 18, 18, 18]))
     cv_agg = {}
-    for mname, idx in [('AUC', 1), ('Brier', 0), ('LogLoss', 2)]:
-        row = f'{mname:<10}'
+    for mname, idx in [('AUC', 1), ('Brier', 0), ('Recall', 3)]:
+        vals_by_m = []
         for m in cv_models:
             vals = [r['cv'][m][idx] for r in results]
             cv_agg.setdefault(m, {})[mname] = np.asarray(vals)
-            row += f'{np.mean(vals):.4f}±{np.std(vals):.4f}  '
-        print(row)
+            vals_by_m.append(f'{np.mean(vals):.4f}±{np.std(vals):.4f}')
+        print(_row([mname] + vals_by_m, [14, 18, 18, 18]))
     print('-' * 74)
-    for mname in ('AUC', 'Brier', 'LogLoss', "Moran's I", 'Cont. ed.', 'Iso ratio'):
+    for mname in ('AUC', 'Brier', 'Recall', "Moran's I", 'Cont. ed.', 'Iso ratio'):
         d = np.mean(agg['ASR'][mname] - agg['CE'][mname])
         print(f'平均改善 (ASR − CE, 测试集): Δ{mname} {d:+.4f}')
-    for mname in ('AUC', 'Brier', 'LogLoss'):
+    for mname in ('AUC', 'Brier', 'Recall'):
         d = np.mean(cv_agg['ASR'][mname] - cv_agg['CE'][mname])
         print(f'平均改善 (ASR − CE, 空间CV): Δ{mname} {d:+.4f}')
     print('-' * 74)
@@ -1001,9 +1026,9 @@ def run_study(args, lam_grid):
     from scipy import stats
     print(f'配对显著性（每模拟 Δ = ASR − CE；配对 t 与 Wilcoxon 符号秩，n={len(results)}）:')
     for src, key, mlist, asr_key in (
-            ('测试集', 'test', [('AUC', 0), ('Brier', 1), ('LogLoss', 5),
+            ('测试集', 'test', [('AUC', 0), ('Brier', 1), ('Recall', 6),
                                 ("Moran's I", 2), ('Cont. ed.', 3), ('Iso ratio', 4)], 'ASRb'),
-            ('空间CV', 'cv', [('AUC', 1), ('Brier', 0), ('LogLoss', 2)], 'ASR')):
+            ('空间CV', 'cv', [('AUC', 1), ('Brier', 0), ('Recall', 3)], 'ASR')):
         for mname, idx in mlist:
             d = np.array([r[key][asr_key][idx] - r[key]['CE'][idx] for r in results])
             t, p = stats.ttest_1samp(d, 0.0)
@@ -1015,43 +1040,40 @@ def run_study(args, lam_grid):
                   f't={t:+.2f} p={p:.4f}  Wilcoxon p={wp:.4f}')
     print('-' * 74)
     print('按 生成×分块 组合（跨种子平均 AUC / Brier，测试集）:')
-    print(f'{"组合":<28}{"CE":<18}{"SR(λ=1.0)":<20}{"ASR":<14}')
+    print(_row(['组合', 'CE', 'SR(λ=1.0)', 'ASR'], [22, 22, 22, 22]))
     for gname in gens:
         for pname in parts:
             rs = [r for r in results if r['gname'] == gname and r['pname'] == pname]
-            row = f'{gname}×{pname:<16}'
+            cells = [f'{gname}×{pname}']
             for m in ('CE', 'ASRg', 'ASRb'):
                 a = np.mean([r['test'][m][0] for r in rs])
                 b = np.mean([r['test'][m][1] for r in rs])
-                row += f'{a:.4f}/{b:.4f}  '
-            print(row)
+                cells.append(f'{a:.4f}/{b:.4f}')
+            print(_row(cells, [22, 22, 22, 22]))
     print('-' * 74)
     print('按 生成×分块 组合（跨种子平均 AUC / Brier，空间CV）:')
-    print(f'{"组合":<28}{"CE":<18}{"SR(λ=1.0)":<20}{"ASR":<14}')
+    print(_row(['组合', 'CE', 'SR(λ=1.0)', 'ASR'], [22, 22, 22, 22]))
     for gname in gens:
         for pname in parts:
             rs = [r for r in results if r['gname'] == gname and r['pname'] == pname]
-            row = f'{gname}×{pname:<16}'
+            cells = [f'{gname}×{pname}']
             for m in cv_models:
                 a = np.mean([r['cv'][m][1] for r in rs])
                 b = np.mean([r['cv'][m][0] for r in rs])
-                row += f'{a:.4f}/{b:.4f}  '
-            print(row)
+                cells.append(f'{a:.4f}/{b:.4f}')
+            print(_row(cells, [22, 22, 22, 22]))
     print('-' * 74)
-    print('按 生成 分档精度（跨 3 分块 × 10 种子；每格 CE / SR(λ=1.0) / ASR）:')
-    hdr = f'{"生成":<10}'
-    for col, key, idx in (('AUC(CV)', 'cv', 1), ('Brier(CV)', 'cv', 0),
-                          ('LogLoss(CV)', 'cv', 2), ('Iso(test)', 'test', 4)):
-        hdr += f'{col:<28}'
-    print(hdr)
+    print(f'按 生成 分档精度（跨 3 分块 × {args.reps} 种子；每格 CE / SR(λ=1.0) / ASR）:')
+    cols = [('AUC(CV)', 'cv', 1), ('Brier(CV)', 'cv', 0),
+            ('Recall(CV)', 'cv', 3), ('Iso(test)', 'test', 4)]
+    print(_row(['生成'] + [c[0] for c in cols], [12, 28, 28, 28, 28]))
     for gname in gens:
         rs = [r for r in results if r['gname'] == gname]
-        row = f'{gname:<10}'
-        for col, key, idx in (('AUC(CV)', 'cv', 1), ('Brier(CV)', 'cv', 0),
-                              ('LogLoss(CV)', 'cv', 2), ('Iso(test)', 'test', 4)):
+        cells = [gname]
+        for col, key, idx in cols:
             ms = ('CE', 'SR(λ=1.0)', 'ASR') if key == 'cv' else ('CE', 'ASRg', 'ASRb')
-            row += '/'.join(f'{np.mean([r[key][m][idx] for r in rs]):.4f}' for m in ms).ljust(28)
-        print(row)
+            cells.append('/'.join(f'{np.mean([r[key][m][idx] for r in rs]):.4f}' for m in ms))
+        print(_row(cells, [12, 28, 28, 28, 28]))
     print('-' * 74)
     # λ* 选择分布（训练侧块内 CV，对应行政 λ 选择口径）
     from collections import Counter
