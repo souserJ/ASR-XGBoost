@@ -1,142 +1,144 @@
-# ASR-XGBoost（最小演示版）
+[English](README.md) | [中文](README.zh-CN.md)
 
-自适应空间正则化 XGBoost（**A**daptive **S**patial **R**egularization **XGBoost）核心思想的**最小可运行演示**，包含**分块自适应 λ 选择**与**多情形模拟研究**。
+# ASR-XGBoost (Demo)
 
-在标准逐像元 XGBoost 基础上，把**空间连续性**直接嵌入训练目标：用邻域软标签约束每个像元的预测，并用**门控函数**把正则化强度集中到模型最不确定（预测概率接近 0.5）的位置。本仓库进一步展示：
+A **minimal end-to-end demo** of the **A**daptive **S**patial **R**egularization **XGBoost** core idea, featuring **block-wise adaptive λ selection** and a **multi-scenario simulation study**.
 
-- **生态连通性加权软标签**：用阻力面定义邻域权重，地形屏障两侧的像元不再被当作"邻居"；
-- **分块自适应 λ**：在平面上划分"国家"块（可自己圈区域），每块在**块内 k 折交叉验证**上网格搜索最优正则化强度 λ\*，按逐像元 λ 映射训练；
-- **多情形模拟研究**：多种数据生成方式 × 多种分块方式 × 多个种子，聚合平均精度（mean±std）。
+Building on standard pixel-wise XGBoost, spatial continuity is embedded directly into the training objective: neighborhood soft labels constrain each pixel's prediction, and a **gating function** concentrates the regularization strength where the model is most uncertain (predicted probability near 0.5). This repository further demonstrates:
 
-> 本仓库是公开的"小而真"演示版：合成数据、单文件、秒级运行。完整版（真实数据、精细工程实现）用于学术论文，暂不公开。
+- **Connectivity-weighted soft labels**: neighborhood weights defined by a resistance surface, so pixels on opposite sides of a terrain barrier are no longer treated as "neighbors";
+- **Block-wise adaptive λ**: the plane is partitioned into "country" blocks (or blocks you draw yourself); each block selects its optimal regularization strength λ\* by **within-block k-fold cross-validation**, and training uses a per-pixel λ map;
+- **Multi-scenario simulation study**: multiple data generators × multiple block partitions × multiple seeds, aggregated as mean±std.
 
-## 数据生成（每环都有标准出处）
+> This is a public "small but real" demo: synthetic data, single file, runs in seconds. The full version (real data, production-grade implementation) is used for the academic paper and is not released.
 
-| 环节 | 方法 |
+## Data Generation
+
+| Component | Method |
 |---|---|
-| 环境变量场 X1~X3 | **GSTools** Matern 高斯随机场，**嵌套双尺度**（长程趋势 + 局地变异），3 个协变量 |
-| 阻力面 R | 地形山脊 + 噪声；**曲折海岸线**（多正弦叠加，阻力=100 绝对屏障） |
-| 适宜性 p_true | 协变量响应函数 + **交互项**（非线性空间结构）；碎片块叠加可学习锐边 |
-| 观测标签 y | ① 伯努利出现采样 + 分块检测/报告异质性噪声（**漏报的代理**）；② 点过程模式：**LGCP/非齐次泊松**（像元事件数~Poisson(λ(s))，出现=至少 1 事件） |
+| Environmental fields X1~X3 | **GSTools** Matern Gaussian random fields, **nested dual-scale** (long-range trend + local variation), 3 covariates |
+| Resistance surface R | Terrain ridges + noise; **sinuous coastline** (superposed sinusoids, resistance = 100 absolute barrier) |
+| Suitability p_true | Covariate response functions + **interaction term** (nonlinear spatial structure); superimposed fragment patches for learnable sharp edges |
+| Observed labels y | ① Bernoulli occurrence sampling + block-wise detection/reporting heterogeneity noise (**proxy for under-reporting**); ② point-process pattern: **LGCP/inhomogeneous Poisson** (pixel event count ~ Poisson(λ(s)); occurrence = at least 1 event) |
 
-## 核心方法
+## Core Method
 
-训练目标：
+Training objective:
 
 $$
 \mathcal{L}_{\mathrm{ASR}} = \mathcal{L}_{\mathrm{CE}} + \lambda_i \cdot \delta(\hat p)\,(p - \tilde p)^2
 $$
 
-- $p$：模型输出概率；$\tilde p$：软标签（邻域加权均值）
-- 门控函数 $\delta(\hat p) = 1 - 2|\hat p - 0.5|$：预测越接近 0.5（越不确定），正则化越强；由基线预测 $\hat p$ 计算并**冻结**（frozen gating），保证逐样本 Hessian 正定
-- 软标签 $\tilde p_i = \dfrac{\sum_j w_{ij}\,\hat p_j}{\sum_j w_{ij}}$，连通性加权 $w_{ij} = \exp\!\big(-\beta \cdot (R_i + R_j)/2\big)$
-- 分块自适应：$\lambda_i = \lambda^*_{\text{block}(i)}$，每块 $\lambda^*$ 用**块内 k 折 CV** 选择，**1-SE 规则**（取最优 λ 一个标准误内的最小 λ，glmnet 惯例）——平曲线上自动选最小充分正则化，避免随机落点与过平滑；候选范围 0~3.5（λ=0 即无正则化，等价 CE；3.5 为论文敏感性上限）；小区域按**质心最近邻合并**（对应行政分块 strategy B 的"小国合并"，保证块内 CV 稳定）
-- 数据划分：总像元按 `--sample`（默认 **40%**）随机采样为数据集（模拟观测稀疏），数据集内按 `--split`（默认 **7:2:1**，与论文口径一致）划分，测试集不参与任何选择
+- $p$: model output probability; $\tilde p$: soft label (neighborhood weighted mean)
+- Gating function $\delta(\hat p) = 1 - 2|\hat p - 0.5|$: the closer the prediction is to 0.5 (more uncertain), the stronger the regularization; computed from the baseline prediction $\hat p$ and **frozen** (frozen gating), guaranteeing per-sample Hessian positive definiteness
+- Soft label $\tilde p_i = \dfrac{\sum_j w_{ij}\,\hat p_j}{\sum_j w_{ij}}$, connectivity weight $w_{ij} = \exp\!\big(-\beta \cdot (R_i + R_j)/2\big)$
+- Block-wise adaptive: $\lambda_i = \lambda^*_{\text{block}(i)}$, each block's $\lambda^*$ selected by **within-block k-fold CV** with the **1-SE rule** (smallest λ within one standard error of the optimal λ, glmnet convention) — automatically picks the minimal sufficient regularization on flat curves, avoiding random tie-breaking and over-smoothing; candidate range 0–3.5 (λ=0 = no regularization, equivalent to CE; 3.5 = upper sensitivity bound in the paper); small regions are merged by **centroid nearest-neighbor** (corresponding to "small-country merging" of administrative-block strategy B, ensuring stable within-block CV)
+- Data split: total pixels randomly sampled via `--sample` (default **40%**) as the dataset (simulating sparse observation); within the dataset, split via `--split` (default **7:2:1**, consistent with the paper); the test set does not participate in any selection
 
-## 文件
+## Files
 
-| 文件 | 说明 |
+| File | Description |
 |---|---|
-| `asr_demo.py` | 主脚本：单次详细演示 + `--study` 多情形模拟研究 |
-| `draw_regions.py` | 交互式圈定区域脚本（鼠标画多边形），输出 `regions.npy` |
+| `asr_demo.py` | Main script: single detailed demo + `--study` multi-scenario simulation study |
+| `draw_regions.py` | Interactive region-drawing script (mouse polygon), outputs `regions.npy` |
 | `requirements.txt` | numpy / xgboost / matplotlib / gstools |
 
-## 运行
+## Usage
 
 ```bash
 pip install -r requirements.txt
 
-python asr_demo.py                          # 单次详细演示（300×300, 16 块, 40% 采样, 空间 CV 评估与六联图：真值/分块/λ*/CE/ASR/差值）
-python asr_demo.py --study                    # 模拟研究：三档难度 g_clean,g_mid,g_hard × 3 分块 × 2 种子 = 18 次（逐模拟缓存）
-python asr_demo.py --study --gens g_clean     # 只跑简单：低噪声
-python asr_demo.py --study --gens g_mid       # 只跑中等：全块 σ≈0.22 中等噪声
-python asr_demo.py --study --gens g_hard      # 只跑困难：弱信号 + 高噪声
-python asr_demo.py --study --gens g_clean,g_mid,g_hard --reps 10   # 三档全跑，配对显著性（推荐）
-python asr_demo.py --study --reps 3           # 增加重复种子数
-python asr_demo.py --study --no-cache         # 忽略缓存，强制全部重跑
-python asr_demo.py --blocks regions.npy     # 用自己圈的区域（单次模式）
+python asr_demo.py                          # single detailed demo (300×300, 16 blocks, 40% sampling, spatial CV evaluation and 6-panel figure: truth/blocks/λ*/CE/ASR/difference)
+python asr_demo.py --study                    # simulation study: 3 difficulty levels g_clean,g_mid,g_hard × 3 partitions × 2 seeds = 18 runs (per-simulation cache)
+python asr_demo.py --study --gens g_clean     # easy only: low noise
+python asr_demo.py --study --gens g_mid       # medium only: full-block σ≈0.22 moderate noise
+python asr_demo.py --study --gens g_hard      # hard only: weak signal + high noise
+python asr_demo.py --study --gens g_clean,g_mid,g_hard --reps 10   # all three levels, paired significance (recommended)
+python asr_demo.py --study --reps 3           # increase number of seeds
+python asr_demo.py --study --no-cache         # ignore cache, force full rerun
+python asr_demo.py --blocks regions.npy     # use your own drawn regions (single-run mode)
 ```
 
-**自己圈区域**（Windows 图形界面）：
+**Draw your own regions** (Windows GUI):
 
 ```bash
 python draw_regions.py
-# 左键加点 | 右键闭合一块 | c 撤销 | q 保存退出
+# left-click: add point | right-click: close a block | c: undo | q: save and exit
 python asr_demo.py --blocks regions.npy
 ```
 
-## 模拟研究（--study）
+## Simulation Study (--study)
 
-设计：默认 **三档难度（g_clean 简单 / g_mid 中等 / g_hard 困难）× 3 种分块方式 × 2 个种子 = 18 次模拟**（`--gens` 可选单一难度或加入其他生成器）。每次模拟同时输出**测试集**指标（AUC / Brier / Recall 与空间指标 Moran's I / ContED / Iso ratio，与论文 External validation 表指标行一致）与 **final 式空间 CV** 指标（3×3 网格块折，块不跨折，每折重训并重算软标签/门控，无泄漏；ASR 默认用**训练侧预选 λ\***（公平版，与测试集同口径）），最后聚合平均（mean±std）并给出 ASR 相对 CE 的平均改善。另输出**子集增益**：仅在 λ\*>0 区域（ASR 实际生效）与 CE∈[0.4,0.6] 风险带（门控最强）的像元池上的 ASR−CE 改善。命名与论文一致：SR(λ=1.0)（固定强度）、ASR（分块自适应）。
+Design: default **three difficulty levels (g_clean / g_mid / g_hard) × 3 block partitions × 2 seeds = 18 simulations** (`--gens` to select a single difficulty or add other generators). Each simulation reports both **test-set** metrics (AUC / Brier / Recall plus spatial metrics Moran's I / ContED / Iso ratio, matching the indicator rows of the paper's External validation table) and **final-style spatial CV** metrics (3×3 grid-block folds, blocks never split across folds, each fold retrains and recomputes soft labels/gating, no leakage; ASR uses **training-side preselected λ\*** by default (fair version, same protocol as the test set)), then aggregates mean±std and reports the average ASR improvement over CE. Additionally reports **subset gains**: the ASR−CE improvement restricted to pixels where λ\*>0 (where ASR is actually active) and to the CE∈[0.4,0.6] risk band (strongest gating). Naming matches the paper: SR(λ=1.0) (fixed strength), ASR (block-wise adaptive).
 
-- 数据生成（按难度分档）：`g_clean`（**简单**：低噪声）/ `g_mid`（**中等**：全块 σ≈0.22 中等噪声）/ `g_hard`（**困难**：弱信号 logit×0.45 + σ≈0.35，CE 预测大量接近 0.5，放大 ASR 门控收益）；其他生成器：`g_noisy`（高漏报异质性）/ `g_noisy2`（全块高噪声）/ `g_barrier`（强地形屏障）/ `g_lgcp`（点过程 LGCP）
-- 分块方式：`p_voronoi`（Voronoi 随机国家块）/ `p_grid`（规则网格块，对应 5°×5° 网格惯例）/ `p_resist`（生态阻力分区）
-- 输出：逐次模拟进度（缓存/重跑标记）→ 测试集汇总表 → 空间 CV 汇总表 → 平均改善 → 子集增益 → 配对显著性（每模拟 Δ = ASR−CE，配对 t + Wilcoxon）→ 按 生成×分块 组合表（测试集 + 空间CV）→ λ\* 选择分布
-- **缓存**：逐模拟结果存 `study_cache.pkl`（key 含全部参数，改参数自动失效）；二次运行命中缓存秒出；`--no-cache` 强制重跑
+- Data generators (by difficulty): `g_clean` (**easy**: low noise) / `g_mid` (**medium**: full-block σ≈0.22 moderate noise) / `g_hard` (**hard**: weak signal logit×0.45 + σ≈0.35, CE predictions largely near 0.5, amplifying the ASR gating gain); other generators: `g_noisy` (high under-reporting heterogeneity) / `g_noisy2` (full-block high noise) / `g_barrier` (strong terrain barrier) / `g_lgcp` (point-process LGCP)
+- Block partitions: `p_voronoi` (Voronoi random "country" blocks) / `p_grid` (regular grid blocks, corresponding to the 5°×5° grid convention) / `p_resist` (ecological resistance partitions)
+- Output: per-simulation progress (cache/rerun markers) → test-set summary table → spatial CV summary table → mean improvement → subset gains → paired significance (per-simulation Δ = ASR−CE, paired t + Wilcoxon) → generator × partition combination table (test set + spatial CV) → λ\* selection distribution
+- **Cache**: per-simulation results stored in `study_cache.pkl` (keys include all parameters; parameter changes invalidate automatically); reruns hit the cache in seconds; `--no-cache` forces a full rerun
 
-示例输出（三档难度 × 3 分块 × 10 种子 = 90 次模拟，测试集 + 空间 CV 双口径）：
+Example output (3 difficulties × 3 partitions × 10 seeds = 90 simulations, both test-set and spatial-CV protocols):
 
 ```
-模拟研究汇总：3 种数据生成 × 3 种分块 × 10 个种子 = 90 次模拟
+Simulation study summary: 3 data generators × 3 partitions × 10 seeds = 90 simulations
 ------------------------------------------------------------------
-测试集指标（7:2:1 划分，ASR 用训练侧分块 λ*；mean±std）:
-     指标      |         CE         |     SR(λ=1.0)      |        ASR
-     AUC       |   0.7261±0.0903    |   0.7286±0.0897    |   0.7304±0.0883
-    Brier      |   0.2065±0.0301    |   0.2053±0.0300    |   0.2048±0.0298
-    Recall     |   0.6568±0.0971    |   0.6596±0.0977    |   0.6617±0.0970
-  Moran's I    |   0.8669±0.0718    |   0.8970±0.0535    |   0.9117±0.0385
-  Cont. ed.    |   0.0763±0.0069    |   0.0662±0.0081    |   0.0617±0.0105
-  Iso ratio    |   0.4425±0.0353    |   0.3730±0.0493    |   0.3340±0.0700
+Test-set metrics (7:2:1 split, ASR uses training-side block λ*; mean±std):
+     Metric      |         CE         |     SR(λ=1.0)      |        ASR
+     AUC         |   0.7261±0.0903    |   0.7286±0.0897    |   0.7304±0.0883
+    Brier        |   0.2065±0.0301    |   0.2053±0.0300    |   0.2048±0.0298
+    Recall       |   0.6568±0.0971    |   0.6596±0.0977    |   0.6617±0.0970
+  Moran's I      |   0.8669±0.0718    |   0.8970±0.0535    |   0.9117±0.0385
+  Cont. ed.      |   0.0763±0.0069    |   0.0662±0.0081    |   0.0617±0.0105
+  Iso ratio      |   0.4425±0.0353    |   0.3730±0.0493    |   0.3340±0.0700
 ------------------------------------------------------------------
-空间 CV（3×3 网格块折，块不跨折，每折重训+重算软标签，ASR 用训练侧预选 λ*（公平版））:
-     指标      |         CE         |     SR(λ=1.0)      |        ASR
-     AUC       |   0.6938±0.0841    |   0.6980±0.0837    |   0.6996±0.0822
-    Brier      |   0.2109±0.0283    |   0.2092±0.0283    |   0.2086±0.0279
-    Recall     |   0.6194±0.0910    |   0.6217±0.0931    |   0.6214±0.0936
+Spatial CV (3×3 grid-block folds, blocks never split across folds, retrain + recompute soft labels per fold, ASR uses training-side preselected λ* (fair version)):
+     Metric      |         CE         |     SR(λ=1.0)      |        ASR
+     AUC         |   0.6938±0.0841    |   0.6980±0.0837    |   0.6996±0.0822
+    Brier        |   0.2109±0.0283    |   0.2092±0.0283    |   0.2086±0.0279
+    Recall       |   0.6194±0.0910    |   0.6217±0.0931    |   0.6214±0.0936
 ------------------------------------------------------------------
-配对显著性（每模拟 Δ = ASR − CE；配对 t + Wilcoxon，n=90）:
-  空间CV AUC      Δ+0.0058±0.0035  t=+15.52  p<0.0001  Wilcoxon p<0.0001
-  空间CV Brier    Δ-0.0022±0.0010  t=-20.47  p<0.0001  Wilcoxon p<0.0001
-  测试集 Recall   Δ+0.0049±0.0167  t=+2.75  p=0.0072  Wilcoxon p=0.0080
-  测试集 Iso ratio Δ-0.1085±0.0594  t=-17.25  p<0.0001  Wilcoxon p<0.0001
+Paired significance (per-simulation Δ = ASR − CE; paired t + Wilcoxon, n=90):
+  SpatialCV AUC      Δ+0.0058±0.0035  t=+15.52  p<0.0001  Wilcoxon p<0.0001
+  SpatialCV Brier    Δ-0.0022±0.0010  t=-20.47  p<0.0001  Wilcoxon p<0.0001
+  Test Recall        Δ+0.0049±0.0167  t=+2.75  p=0.0072  Wilcoxon p=0.0080
+  Test Iso ratio     Δ-0.1085±0.0594  t=-17.25  p<0.0001  Wilcoxon p<0.0001
 ------------------------------------------------------------------
-按 生成 分档精度（跨 3 分块 × 10 种子；每格 CE / SR(λ=1.0) / ASR）:
-    生成     |           AUC(CV)            |          Brier(CV)           |          Recall(CV)          |          Iso(test)
-  g_clean    |     0.7800/0.7837/0.7837     |     0.1797/0.1779/0.1778     |     0.7121/0.7158/0.7147     |     0.4409/0.3931/0.3832
-   g_mid     |     0.7157/0.7199/0.7211     |     0.2073/0.2058/0.2053     |     0.6273/0.6305/0.6311     |     0.4493/0.3854/0.3551
-   g_hard    |     0.5858/0.5903/0.5939     |     0.2457/0.2439/0.2428     |     0.5189/0.5188/0.5185     |     0.4374/0.3404/0.2636
+By-generator accuracy (across 3 partitions × 10 seeds; each cell CE / SR(λ=1.0) / ASR):
+   Generator   |          AUC(CV)            |          Brier(CV)           |          Recall(CV)          |          Iso(test)
+   g_clean     |     0.7800/0.7837/0.7837     |     0.1797/0.1779/0.1778     |     0.7121/0.7158/0.7147     |     0.4409/0.3931/0.3832
+    g_mid      |     0.7157/0.7199/0.7211     |     0.2073/0.2058/0.2053     |     0.6273/0.6305/0.6311     |     0.4493/0.3854/0.3551
+    g_hard     |     0.5858/0.5903/0.5939     |     0.2457/0.2439/0.2428     |     0.5189/0.5188/0.5185     |     0.4374/0.3404/0.2636
 ------------------------------------------------------------------
-训练侧分块自适应 λ* 选择分布（全部模拟的所有块）:
-  λ=0.0: 5 块, λ=0.5: 16 块, λ=1.0: 31 块, λ=1.5: 43 块, λ=2.0: 47 块,
-  λ=2.5: 27 块, λ=3.0: 8 块, λ=3.5: 3 块
+Training-side block-wise adaptive λ* selection distribution (all blocks, all simulations):
+  λ=0.0: 5 blocks, λ=0.5: 16 blocks, λ=1.0: 31 blocks, λ=1.5: 43 blocks, λ=2.0: 47 blocks,
+  λ=2.5: 27 blocks, λ=3.0: 8 blocks, λ=3.5: 3 blocks
 ------------------------------------------------------------------
-要点：全部模型按 7:2:1 划分 + 验证集早停（上限 1000 轮，与论文配置一致）。
-三档难度下 ASR 相对 CE 的增益随难度单调递增（空间CV ΔAUC +0.0037 / +0.0054 /
-+0.0081，配对检验全显著），判别精度从不退化；空间指标（Moran's I / ContED /
-Iso ratio，与论文口径一致）全面改善（困难档孤立像元比例降 17.4 个百分点）；
-门控带 CE∈[0.4,0.6] 增益约为全局 4~5 倍（测试集 ΔAUC 0.0238 vs 0.0044；
-空间CV 0.0245 vs 0.0058，验证门控设计）；λ* 随数据难度自适应（均值
-1.23 / 1.60 / 2.17）。
+Key points: all models use 7:2:1 split + validation early stopping (max 1000 rounds, consistent with the paper).
+The ASR gain over CE increases monotonically with difficulty (spatial-CV ΔAUC +0.0037 / +0.0054 /
++0.0081, all paired tests significant), with no degradation in discriminative accuracy; spatial
+metrics (Moran's I / ContED / Iso ratio, consistent with the paper) improve across the board
+(isolated-pixel ratio drops 17.4 percentage points in the hard setting); gating-band gains
+CE∈[0.4,0.6] are ~4–5× the global gain (test ΔAUC 0.0238 vs 0.0044; spatial CV 0.0245 vs 0.0058,
+validating the gating design); λ* adapts to data difficulty (means 1.23 / 1.60 / 2.17).
 
-## 关于本仓库（演示版定位）
+## About This Repository (Demo Positioning)
 
-| 方面 | 本演示版（公开） |
+| Aspect | This demo (public) |
 |---|---|
-| 数据 | GSTools 合成场 + 响应函数 + LGCP（无任何真实疾病数据） |
-| 连通性成本 | 局部阻力近似 $(R_i+R_j)/2$ |
-| 分块 | 合成块 / 自圈区域；小区域质心最近邻合并；只做 λ 分块 |
-| 采样 | 随机像元 + 分块检测异质性 |
-| 验证 | final 式空间 CV（3×3 网格块折，块不跨折，每折重训并重算软标签，无泄漏；ASR 用训练侧预选 λ*，公平版；AUC / Brier / Recall，mean±std，与论文 External validation 表指标行一致）+ 测试集评估 + 三档难度模拟研究（测试集与空间 CV 双口径） |
-| 结构 | 单文件演示 |
+| Data | GSTools synthetic fields + response functions + LGCP (no real disease data) |
+| Connectivity cost | Local resistance approximation $(R_i+R_j)/2$ |
+| Partitioning | Synthetic blocks / user-drawn regions; small regions merged by centroid nearest-neighbor; λ-only partitioning |
+| Sampling | Random pixels + block-wise detection heterogeneity |
+| Validation | final-style spatial CV (3×3 grid-block folds, blocks never split across folds, retrain + recompute soft labels per fold, no leakage; ASR uses training-side preselected λ*, fair version; AUC / Brier / Recall, mean±std, matching the indicator rows of the paper's External validation table) + test-set evaluation + three-difficulty simulation study (both test-set and spatial-CV protocols) |
+| Structure | Single-file demo |
 
-> 本仓库为"小而真"的公开演示版：合成数据、单文件、秒级运行，用于方法演示与可复现的模拟验证；完整版（真实数据、精细工程实现）用于学术论文，暂不公开。
+> This is a "small but real" public demo: synthetic data, single file, runs in seconds, intended for method demonstration and reproducible simulation-based validation; the full version (real data, production-grade implementation) is used for the academic paper and is not released.
 
-## 引用
+## Citation
 
-使用或参考本代码，请引用：
+If you use or reference this code, please cite:
 
-> （论文发表后补充：作者, 题目, 期刊, 年份, DOI）
+> (To be filled after publication: authors, title, journal, year, DOI)
 
 ## License
 
-[MIT](LICENSE)。保留版权声明即可自由使用；学术使用请按上述要求引用。
+[MIT](LICENSE). Free to use as long as the copyright notice is retained; for academic use, please cite as requested above.
