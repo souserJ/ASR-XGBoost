@@ -99,7 +99,6 @@ Spatial CV (3×3 grid-block folds, blocks never split across folds, retrain + re
 Paired significance (per-simulation Δ = ASR − CE; paired t + Wilcoxon, n=90):
   SpatialCV AUC      Δ+0.0060±0.0035  t=+15.86  p<0.0001  Wilcoxon p<0.0001
   SpatialCV Brier    Δ-0.0022±0.0011  t=-18.11  p<0.0001  Wilcoxon p<0.0001
-  Test Recall        Δ+0.0034±0.0187  t=+1.70  p=0.0921  Wilcoxon p=0.0766
   Test Iso ratio     Δ-0.1075±0.0566  t=-17.91  p<0.0001  Wilcoxon p<0.0001
 ------------------------------------------------------------------
 By-generator accuracy (across 3 partitions × 10 seeds; each cell CE / SR(λ=1.0) / ASR):
