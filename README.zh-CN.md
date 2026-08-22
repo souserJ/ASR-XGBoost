@@ -47,11 +47,11 @@ $$
 pip install -r requirements.txt
 
 python asr_demo.py                          # 单次详细演示（300×300, 16 块, 40% 采样, 空间 CV 评估与六联图：真值/分块/λ*/CE/ASR/差值）
-python asr_demo.py --study                    # 模拟研究：三档难度 g_clean,g_mid,g_hard × 3 分块 × 2 种子 = 18 次（逐模拟缓存）
+python asr_demo.py --study                    # 模拟研究：三档难度 × 3 分块 × 2 种子 = 18 次（默认 16 块 / min-pixels 150；逐模拟缓存）
 python asr_demo.py --study --gens g_clean     # 只跑简单：低噪声
 python asr_demo.py --study --gens g_mid       # 只跑中等：全块 σ≈0.22 中等噪声
 python asr_demo.py --study --gens g_hard      # 只跑困难：弱信号 + 高噪声
-python asr_demo.py --study --study-nblocks 16 --min-pixels 150 --reps 10   # 正式口径：16 块 + min-pixels 150，三档全跑，配对显著性（推荐）
+python asr_demo.py --study --reps 10   # 正式口径（16 块 / min-pixels 150 已是默认值），三档全跑，配对显著性（推荐）
 python asr_demo.py --study --reps 3           # 增加重复种子数
 python asr_demo.py --study --no-cache         # 忽略缓存，强制全部重跑
 python asr_demo.py --blocks regions.npy     # 用自己圈的区域（单次模式）
@@ -67,7 +67,7 @@ python asr_demo.py --blocks regions.npy
 
 ## 模拟研究（--study）
 
-设计：默认 **三档难度（g_clean 简单 / g_mid 中等 / g_hard 困难）× 3 种分块方式 × 2 个种子 = 18 次模拟**（`--gens` 可选单一难度或加入其他生成器）。每次模拟同时输出**测试集**指标（AUC / Brier / Recall 与空间指标 Moran's I / ContED / Iso ratio，与论文 External validation 表指标行一致）与 **final 式空间 CV** 指标（3×3 网格块折，块不跨折，每折重训并重算软标签/门控，无泄漏；ASR 默认用**训练侧预选 λ\***（公平版，与测试集同口径）），最后聚合平均（mean±std）并给出 ASR 相对 CE 的平均改善。另输出**子集增益**：仅在 λ\*>0 区域（ASR 实际生效）与 CE∈[0.4,0.6] 风险带（门控最强）的像元池上的 ASR−CE 改善。命名与论文一致：SR(λ=1.0)（固定强度）、ASR（分块自适应）。
+设计：默认 **三档难度（g_clean 简单 / g_mid 中等 / g_hard 困难）× 3 种分块方式 × 2 个种子 = 18 次模拟**，分块为 **16 块 / `--min-pixels 150`** 正式默认（`--gens` 可选单一难度或加入其他生成器）。每次模拟同时输出**测试集**指标（AUC / Brier / Recall 与空间指标 Moran's I / ContED / Iso ratio，与论文 External validation 表指标行一致）与 **final 式空间 CV** 指标（3×3 网格块折，块不跨折，每折重训并重算软标签/门控，无泄漏；ASR 默认用**训练侧预选 λ\***（公平版，与测试集同口径）），最后聚合平均（mean±std）并给出 ASR 相对 CE 的平均改善。另输出**子集增益**：仅在 λ\*>0 区域（ASR 实际生效）与 CE∈[0.4,0.6] 风险带（门控最强）的像元池上的 ASR−CE 改善。命名与论文一致：SR(λ=1.0)（固定强度）、ASR（分块自适应）。
 
 - 数据生成（按难度分档）：`g_clean`（**简单**：低噪声）/ `g_mid`（**中等**：全块 σ≈0.22 中等噪声）/ `g_hard`（**困难**：弱信号 logit×0.45 + σ≈0.35，CE 预测大量接近 0.5，放大 ASR 门控收益）；其他生成器：`g_noisy`（高漏报异质性）/ `g_noisy2`（全块高噪声）/ `g_barrier`（强地形屏障）/ `g_lgcp`（点过程 LGCP）
 - 分块方式：`p_voronoi`（Voronoi 随机国家块）/ `p_grid`（规则网格块，对应 5°×5° 网格惯例）/ `p_resist`（生态阻力分区）

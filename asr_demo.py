@@ -771,8 +771,8 @@ def main():
     ap.add_argument('--split', default='7,2,1',
                     help='数据集内训练/验证/测试比例（默认 7:2:1，与论文口径一致）')
     ap.add_argument('--nblocks', type=int, default=16)
-    ap.add_argument('--min-pixels', type=int, default=800,
-                    help='小区域合并阈值（像元数；对应 strategy B 小国合并，保证块内 CV 稳定）')
+    ap.add_argument('--min-pixels', type=int, default=150,
+                    help='小区域合并阈值（正式口径 16 块用 150，保住小块不合并）')
     ap.add_argument('--lam-grid', default='0,0.5,1,1.5,2,2.5,3,3.5',
                     help='λ 候选：0（无正则化，等价 CE）至 3.5（论文敏感性分析上限）')
     ap.add_argument('--cv-folds', type=int, default=5)
@@ -790,7 +790,8 @@ def main():
     ap.add_argument('--parts', default='p_voronoi,p_grid,p_resist')
     ap.add_argument('--reps', type=int, default=2, help='每个组合的重复种子数')
     ap.add_argument('--study-grid', type=int, default=100)
-    ap.add_argument('--study-nblocks', type=int, default=8)
+    ap.add_argument('--study-nblocks', type=int, default=16,
+                    help='模拟研究分块数（正式口径 16 块 + min-pixels 150）')
     ap.add_argument('--no-cache', action='store_true',
                     help='忽略 study/demo 缓存，强制全部重跑')
     args = ap.parse_args()
@@ -1195,16 +1196,17 @@ def run_study(args, lam_grid):
             print(_row(cells, [22, 22, 22, 22]))
     print('-' * 74)
     print(f'按 生成 分档精度（跨 3 分块 × {args.reps} 种子；每格 CE / SR(λ=1.0) / ASR）:')
-    cols = [('AUC(CV)', 'cv', 1), ('Brier(CV)', 'cv', 0),
-            ('Recall(CV)', 'cv', 3), ('Iso(test)', 'test', 4)]
-    print(_row(['生成'] + [c[0] for c in cols], [12, 28, 28, 28, 28]))
+    cols = [('AUC(CV)', 'cv', 1), ('Brier(CV)', 'cv', 0), ('Recall(CV)', 'cv', 3),
+            ('Recall(test)', 'test', 6), ("Moran's I(test)", 'test', 2),
+            ('Cont. ed.(test)', 'test', 3), ('Iso(test)', 'test', 4)]
+    print(_row(['生成'] + [c[0] for c in cols], [10, 18, 18, 18, 18, 18, 18, 18]))
     for gname in gens:
         rs = [r for r in results if r['gname'] == gname]
         cells = [gname]
         for col, key, idx in cols:
             ms = ('CE', 'SR(λ=1.0)', 'ASR') if key == 'cv' else ('CE', 'ASRg', 'ASRb')
             cells.append('/'.join(f'{np.mean([r[key][m][idx] for r in rs]):.4f}' for m in ms))
-        print(_row(cells, [12, 28, 28, 28, 28]))
+        print(_row(cells, [10, 18, 18, 18, 18, 18, 18, 18]))
     print('-' * 74)
     # λ* 选择分布（训练侧块内 CV，对应行政 λ 选择口径）
     from collections import Counter
