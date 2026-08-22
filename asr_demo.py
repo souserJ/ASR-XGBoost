@@ -54,6 +54,7 @@ import matplotlib.pyplot as plt
 import xgboost as xgb
 import gstools as gs
 import unicodedata
+from scipy.ndimage import gaussian_filter
 
 # ==========================================================================
 # 1. 模拟数据生成
@@ -285,6 +286,23 @@ def recall_score(y, p, thr=0.5):
     tp = float(((pred == 1) & (y == 1)).sum())
     fn = float(((pred == 0) & (y == 1)).sum())
     return tp / (tp + fn) if (tp + fn) > 0 else 0.0
+
+
+def calibration_curve(y, p, n_bins=10):
+    """校准曲线（reliability diagram）：等宽分箱，返回 (mean_pred, obs_freq)。
+
+    与论文校准曲线口径一致：预测概率分 n_bins 个等宽 bin，
+    每 bin 画平均预测概率 vs 实际阳性频率。空 bin 返回 NaN 跳过。"""
+    edges = np.linspace(0.0, 1.0, n_bins + 1)
+    idx = np.clip(np.digitize(p, edges[1:-1]), 0, n_bins - 1)
+    mean_pred = np.full(n_bins, np.nan)
+    obs_freq = np.full(n_bins, np.nan)
+    for b in range(n_bins):
+        m = idx == b
+        if m.sum() > 0:
+            mean_pred[b] = p[m].mean()
+            obs_freq[b] = y[m].mean()
+    return mean_pred, obs_freq
 
 
 def spatial_metrics(p, land_mask=None):
@@ -744,6 +762,9 @@ def main():
                     help='单次演示的数据生成场景（g_hard 弱信号困难场景 ASR 收益更明显）')
     ap.add_argument('--seed', type=int, default=42)
     ap.add_argument('--grid', type=int, default=300, help='模拟栅格边长')
+    ap.add_argument('--paper', action='store_true',
+                    help='论文图快捷参数：g_hard + 16 块（100×100 网格 + min-pixels 150，'
+                         '不被合并），ASR−CE 差异明显且分块图完整')
     ap.add_argument('--blocks', default=None, help='regions.npy（draw_regions.py 生成）')
     ap.add_argument('--sample', type=float, default=0.4,
                     help='总像元采样比例作为数据集（默认 0.4，模拟观测稀疏但结果稳定）')
@@ -771,8 +792,16 @@ def main():
     ap.add_argument('--study-grid', type=int, default=100)
     ap.add_argument('--study-nblocks', type=int, default=8)
     ap.add_argument('--no-cache', action='store_true',
-                    help='忽略 study 缓存，强制全部重跑')
+                    help='忽略 study/demo 缓存，强制全部重跑')
     args = ap.parse_args()
+    if args.paper:
+        # 论文图配置：hard 场景 + 16 块（100×100 + min-pixels 150 保住分块）
+        args.gen = 'g_hard'
+        args.grid = 100
+        args.nblocks = 16
+        args.min_pixels = 150
+        print('[Paper] 使用论文图配置：--gen g_hard --grid 100 --nblocks 16 '
+              '--min-pixels 150（16 块全保留，ASR−CE 差异明显）')
     lam_grid = [float(v) for v in args.lam_grid.split(',')]
     split = tuple(float(v) for v in args.split.split(','))
     if args.study:
@@ -780,15 +809,72 @@ def main():
         return
 
     # ---------- 单次详细演示 ----------
-    out = simulate_once(args.gen, 'p_voronoi', args.seed, args.grid,
-                        args.nblocks, args.min_pixels, lam_grid, args.beta,
-                        dict(objective='binary:logistic', eta=0.1, max_depth=4,
-                             subsample=0.8, colsample_bytree=0.8, seed=args.seed),
-                        args.num_round, args.cv_rounds, args.cv_folds,
-                        custom_blocks=(np.load(args.blocks) if args.blocks else None),
-                        verbose=True, split=split, sample_frac=args.sample,
-                        early_stop=args.early_stop)
-    n = out['n']
+    # demo 缓存：同参数直接读缓存，跳过训练与空间 CV（--no-cache 强制重跑）
+    demo_cache_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   'demo_cache.pkl')
+    blocks_tag = args.blocks if args.blocks else 'none'
+    if args.blocks:
+        blocks_tag += f':{os.path.getmtime(args.blocks):.0f}'
+    demo_key = (f'{CACHE_VERSION}|demo|{args.gen}|{args.seed}|{args.grid}|'
+                f'{args.nblocks}|{args.min_pixels}|{args.sample}|{args.split}|'
+                f'{args.beta}|{",".join(map(str, lam_grid))}|{args.cv_folds}|'
+                f'{args.cv_rounds}|{args.num_round}|{args.early_stop}|{blocks_tag}')
+    dcache = {}
+    cached = None
+    if not args.no_cache and os.path.exists(demo_cache_path):
+        try:
+            with open(demo_cache_path, 'rb') as f:
+                dcache = pickle.load(f)
+            cached = dcache.get(demo_key)
+            # 字段校验：缓存结构变化（如新增 te/y）时旧条目缺字段 → 视为未命中重跑
+            _need = {'n', 'n_land', 'n_dataset', 'n_split', 'n_blocks', 'lam_star',
+                     'cv_rows', 'cv_curves', 'p_true', 'labels', 'lam_map',
+                     'ocean', 'p_ce', 'p_asr_b', 'per_fold', 'te', 'y'}
+            if cached is not None and not _need.issubset(cached):
+                print('[Cache] demo 缓存版本过旧（缺字段），重新运行')
+                cached = None
+            if cached is not None:
+                print(f'[Cache] 命中 demo 缓存（{args.gen}, seed={args.seed}, '
+                      f'{args.grid}×{args.grid}, {args.nblocks} 块）→ 跳过训练/空间CV')
+        except Exception:
+            dcache = {}
+            print('[Cache] demo 缓存读取失败，忽略并重跑')
+
+    if cached is None:
+        out = simulate_once(args.gen, 'p_voronoi', args.seed, args.grid,
+                            args.nblocks, args.min_pixels, lam_grid, args.beta,
+                            dict(objective='binary:logistic', eta=0.1, max_depth=4,
+                                 subsample=0.8, colsample_bytree=0.8, seed=args.seed),
+                            args.num_round, args.cv_rounds, args.cv_folds,
+                            custom_blocks=(np.load(args.blocks) if args.blocks else None),
+                            verbose=True, split=split, sample_frac=args.sample,
+                            early_stop=args.early_stop)
+        n = out['n']
+        # final 式空间 CV：3×3 网格块折（对应 5°×5° 惯例），块不跨折；
+        # 每折重训 CE 并重算软标签/门控（无泄漏）；ASR 用训练侧预选 λ*（公平版）。
+        print('>> final 式空间 CV 评估（3×3 网格块折）…', flush=True)
+        glab = grid_blocks(n, 3).ravel()
+        per_fold, _ = spatial_cv_evaluate(out['Xall'], out['y'], out['trva'], glab,
+                                          out['R'], args.beta,
+                                          dict(objective='binary:logistic', eta=0.1,
+                                               max_depth=4, subsample=0.8,
+                                               colsample_bytree=0.8, seed=args.seed),
+                                          args.num_round, out['lam_map'],
+                                          n_folds=args.cv_folds,
+                                          early_stop=args.early_stop)
+        # 写缓存（轻量字段，不含训练大对象）
+        dcache[demo_key] = _demo_cache_entry(out, per_fold)
+        try:
+            with open(demo_cache_path, 'wb') as f:
+                pickle.dump(dcache, f)
+            print(f'[Cache] demo 结果已写入: {demo_cache_path}')
+        except Exception as e:
+            print(f'[Cache] demo 缓存写入失败（不影响本次运行）: {e}')
+    else:
+        out = cached
+        per_fold = cached['per_fold']
+        n = out['n']
+
     n_land = out['n_land']
     n_tr, n_va, n_te = out['n_split']
     print('=' * 66)
@@ -807,18 +893,6 @@ def main():
         print(f'  块 {b:<2}: {pts}')
     print('=' * 66)
 
-    # final 式空间 CV：3×3 网格块折（对应 5°×5° 惯例），块不跨折；
-    # 每折重训 CE 并重算软标签/门控（无泄漏）；ASR 用训练侧预选 λ*（公平版）。
-    print('>> final 式空间 CV 评估（3×3 网格块折）…', flush=True)
-    glab = grid_blocks(n, 3).ravel()
-    per_fold, _ = spatial_cv_evaluate(out['Xall'], out['y'], out['trva'], glab,
-                                      out['R'], args.beta,
-                                      dict(objective='binary:logistic', eta=0.1,
-                                           max_depth=4, subsample=0.8,
-                                           colsample_bytree=0.8, seed=args.seed),
-                                      args.num_round, out['lam_map'],
-                                      n_folds=args.cv_folds,
-                                      early_stop=args.early_stop)
     print(f'空间 CV（3×3 网格块折，{args.cv_folds} 折，mean±std，唯一评估方式）:')
     print(_row(['指标', 'CE', 'SR(λ=1.0)', 'ASR'], [14, 18, 18, 18]))
     for mname, idx in [('AUC', 1), ('Brier', 0), ('Recall', 3)]:
@@ -829,7 +903,7 @@ def main():
         print(_row([mname] + vals_by_m, [14, 18, 18, 18]))
     print('=' * 66)
 
-    # 出图（2×3 六联图：真值/分块/λ* + CE/ASR/差值；差值图放大差距，海洋显示为灰色）
+    # 出图（2×3 六联图：真值/分块+λ*/CE + ASR/差值/校准；差值图放大差距，海洋显示为灰色）
     ocean = out['ocean']
 
     def mask(arr):
@@ -840,24 +914,65 @@ def main():
     p_asr_map = mask(out['p_asr_b'].reshape(n, n))
     diff = p_asr_map - p_ce_g
     vmax = float(np.nanmax(np.abs(diff))) or 1.0   # 差值图对称色标，放大差距
+
+    # ---- 面板2：Blocks & λ*（λ 渐变场为背景 + 黑色分块边界线） ----
+    labels2d = out['labels']
+    lam2d = out['lam_map'].reshape(n, n).astype(float)
+    if ocean is not None:
+        lam2d = np.where(ocean, np.nan, lam2d)
+    lam_fill = np.where(np.isnan(lam2d), np.nanmean(lam2d), lam2d)
+    lam_smooth = gaussian_filter(lam_fill, sigma=max(2.0, n / 60.0))
+    if ocean is not None:
+        lam_smooth = np.where(ocean, np.nan, lam_smooth)
+
     panels = [
         ('True risk', mask(out['p_true']), 'viridis', None),
-        ('Blocks (merged)', mask(out['labels']), 'tab10', None),
-        ('Lambda* by block', mask(out['lam_map'].reshape(n, n)), 'viridis', None),
         ('CE prediction', p_ce_g, 'viridis', None),
-        ('ASR (block-adaptive)', p_asr_map, 'viridis', None),
+        ('ASR', p_asr_map, 'viridis', None),
         ('ASR − CE', diff, 'RdBu_r', (-vmax, vmax)),
     ]
-    for ax, (title, data, cmap_name, vrange) in zip(axes.ravel(), panels):
+    for ax, (title, data, cmap_name, vrange) in zip(
+            [axes[0, 0], axes[1, 0], axes[1, 1], axes[1, 2]], panels):
         cmap = plt.get_cmap(cmap_name)
         cmap.set_bad('0.85')
         kw = dict(origin='lower', vmin=vrange[0], vmax=vrange[1]) if vrange else dict(origin='lower')
+        kw['interpolation'] = 'bilinear'   # 低分辨率栅格放大平滑
         im = ax.imshow(data, cmap=cmap, **kw)
         ax.set_title(title, fontsize=12)
         ax.set_xticks([]); ax.set_yticks([])
         fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    fig.suptitle('ASR-XGBoost demo: CE vs ASR (block-adaptive λ)  '
-                 f'(beta={args.beta}, seed={args.seed})', fontsize=13)
+
+    # ---- Blocks & λ* 面板（λ 渐变背景 + 块边界线） ----
+    ax_bl = axes[0, 1]
+    cmap = plt.get_cmap('viridis')
+    cmap.set_bad('0.85')
+    im_bl = ax_bl.imshow(mask(lam_smooth), cmap=cmap, origin='lower',
+                         interpolation='bilinear')
+    ax_bl.contour(labels2d,
+                  levels=np.arange(-0.5, int(labels2d.max()) + 1, 1.0),
+                  colors='black', linewidths=0.7)
+    ax_bl.set_title('Blocks & λ*', fontsize=12)
+    ax_bl.set_xticks([]); ax_bl.set_yticks([])
+    fig.colorbar(im_bl, ax=ax_bl, fraction=0.046, pad=0.04, label='λ')
+
+    # ---- 校准曲线面板（CE vs ASR，测试集，等宽 10 箱 + 对角线） ----
+    ax_cal = axes[0, 2]
+    y_te = out['y'][out['te']]
+    p_ce_te = out['p_ce'][out['te']]
+    p_asr_te = out['p_asr_b'][out['te']]
+    ax_cal.plot([0, 1], [0, 1], 'k--', lw=0.8, label='Perfect')
+    for p_arr, color, marker, lab in [
+            (p_ce_te, '#4169E1', 'o', 'CE'),
+            (p_asr_te, '#D62728', 's', 'ASR')]:
+        mp, of = calibration_curve(y_te, p_arr, n_bins=10)
+        ax_cal.plot(mp, of, marker + '-', color=color, lw=1.2, ms=4,
+                    label=lab, markevery=1)
+    ax_cal.set_title('Calibration curve', fontsize=12)
+    ax_cal.set_xlabel('Mean predicted probability', fontsize=10)
+    ax_cal.set_ylabel('Observed frequency', fontsize=10)
+    ax_cal.set_xlim(0, 1); ax_cal.set_ylim(0, 1)
+    ax_cal.legend(fontsize=9, loc='upper left')
+
     fig.tight_layout()
     fig.savefig('demo_result.png', dpi=140)
     print('✅ 全部完成，图片已保存: demo_result.png', flush=True)
@@ -870,6 +985,22 @@ def _cache_entry(out):
                 test=out['test'], cv=out['cv'], cv_pts=out['cv_pts'],
                 te=out['te'], y=out['y'], p_ce=out['p_ce'],
                 p_asr_b=out['p_asr_b'], lam_map=out['lam_map'])
+
+
+def _demo_cache_entry(out, per_fold):
+    """提取单次 demo 出图/打印所需字段（不含 Xall/y/R/soft 等训练大对象）。
+
+    命中缓存时跳过训练与空间 CV，直接用这些字段打印 + 出图。"""
+    return dict(
+        n=out['n'], n_land=out['n_land'], n_dataset=out['n_dataset'],
+        n_split=out['n_split'], n_blocks=out['n_blocks'],
+        lam_star=out['lam_star'], cv_rows=out['cv_rows'],
+        cv_curves=out['cv_curves'],
+        p_true=out['p_true'], labels=out['labels'], lam_map=out['lam_map'],
+        ocean=out['ocean'], p_ce=out['p_ce'], p_asr_b=out['p_asr_b'],
+        te=out['te'], y=out['y'],
+        per_fold=per_fold,
+    )
 
 
 def run_study(args, lam_grid):
