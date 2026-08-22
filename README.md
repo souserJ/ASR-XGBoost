@@ -53,7 +53,7 @@ python asr_demo.py --study                    # simulation study: 3 difficulty l
 python asr_demo.py --study --gens g_clean     # easy only: low noise
 python asr_demo.py --study --gens g_mid       # medium only: full-block σ≈0.22 moderate noise
 python asr_demo.py --study --gens g_hard      # hard only: weak signal + high noise
-python asr_demo.py --study --gens g_clean,g_mid,g_hard --reps 10   # all three levels, paired significance (recommended)
+python asr_demo.py --study --study-nblocks 16 --min-pixels 150 --reps 10   # formal protocol: 16 blocks + min-pixels 150, paired significance (recommended)
 python asr_demo.py --study --reps 3           # increase number of seeds
 python asr_demo.py --study --no-cache         # ignore cache, force full rerun
 python asr_demo.py --blocks regions.npy     # use your own drawn regions (single-run mode)
@@ -76,49 +76,49 @@ Design: default **three difficulty levels (g_clean / g_mid / g_hard) × 3 block 
 - Output: per-simulation progress (cache/rerun markers) → test-set summary table → spatial CV summary table → mean improvement → subset gains → paired significance (per-simulation Δ = ASR−CE, paired t + Wilcoxon) → generator × partition combination table (test set + spatial CV) → λ\* selection distribution
 - **Cache**: per-simulation results stored in `study_cache.pkl` (keys include all parameters; parameter changes invalidate automatically); reruns hit the cache in seconds; `--no-cache` forces a full rerun
 
-Example output (3 difficulties × 3 partitions × 10 seeds = 90 simulations, both test-set and spatial-CV protocols):
+Example output (formal protocol: **16 blocks / min-pixels 150**; 3 difficulties × 3 partitions × 10 seeds = 90 simulations, both test-set and spatial-CV protocols):
 
 ```
-Simulation study summary: 3 data generators × 3 partitions × 10 seeds = 90 simulations
+Simulation study summary: 3 data generators × 3 partitions × 10 seeds = 90 simulations (16 blocks, min-pixels 150)
 ------------------------------------------------------------------
 Test-set metrics (7:2:1 split, ASR uses training-side block λ*; mean±std):
      Metric      |         CE         |     SR(λ=1.0)      |        ASR
-     AUC         |   0.7261±0.0903    |   0.7286±0.0897    |   0.7304±0.0883
-    Brier        |   0.2065±0.0301    |   0.2053±0.0300    |   0.2048±0.0298
-    Recall       |   0.6568±0.0971    |   0.6596±0.0977    |   0.6617±0.0970
-  Moran's I      |   0.8669±0.0718    |   0.8970±0.0535    |   0.9117±0.0385
-  Cont. ed.      |   0.0763±0.0069    |   0.0662±0.0081    |   0.0617±0.0105
-  Iso ratio      |   0.4425±0.0353    |   0.3730±0.0493    |   0.3340±0.0700
+     AUC         |   0.7229±0.0940    |   0.7259±0.0932    |   0.7276±0.0923
+    Brier        |   0.2072±0.0311    |   0.2060±0.0308    |   0.2055±0.0306
+    Recall       |   0.6556±0.0968    |   0.6558±0.0969    |   0.6590±0.0990
+  Moran's I      |   0.8667±0.0711    |   0.8966±0.0529    |   0.9109±0.0408
+  Cont. ed.      |   0.0764±0.0073    |   0.0662±0.0083    |   0.0617±0.0103
+  Iso ratio      |   0.4412±0.0379    |   0.3730±0.0501    |   0.3338±0.0695
 ------------------------------------------------------------------
 Spatial CV (3×3 grid-block folds, blocks never split across folds, retrain + recompute soft labels per fold, ASR uses training-side preselected λ* (fair version)):
      Metric      |         CE         |     SR(λ=1.0)      |        ASR
-     AUC         |   0.6938±0.0841    |   0.6980±0.0837    |   0.6996±0.0822
-    Brier        |   0.2109±0.0283    |   0.2092±0.0283    |   0.2086±0.0279
-    Recall       |   0.6194±0.0910    |   0.6217±0.0931    |   0.6214±0.0936
+     AUC         |   0.6907±0.0800    |   0.6947±0.0793    |   0.6966±0.0777
+    Brier        |   0.2121±0.0270    |   0.2105±0.0268    |   0.2099±0.0263
+    Recall       |   0.6163±0.0867    |   0.6178±0.0893    |   0.6178±0.0889
 ------------------------------------------------------------------
 Paired significance (per-simulation Δ = ASR − CE; paired t + Wilcoxon, n=90):
-  SpatialCV AUC      Δ+0.0058±0.0035  t=+15.52  p<0.0001  Wilcoxon p<0.0001
-  SpatialCV Brier    Δ-0.0022±0.0010  t=-20.47  p<0.0001  Wilcoxon p<0.0001
-  Test Recall        Δ+0.0049±0.0167  t=+2.75  p=0.0072  Wilcoxon p=0.0080
-  Test Iso ratio     Δ-0.1085±0.0594  t=-17.25  p<0.0001  Wilcoxon p<0.0001
+  SpatialCV AUC      Δ+0.0060±0.0035  t=+15.86  p<0.0001  Wilcoxon p<0.0001
+  SpatialCV Brier    Δ-0.0022±0.0011  t=-18.11  p<0.0001  Wilcoxon p<0.0001
+  Test Recall        Δ+0.0034±0.0187  t=+1.70  p=0.0921  Wilcoxon p=0.0766
+  Test Iso ratio     Δ-0.1075±0.0566  t=-17.91  p<0.0001  Wilcoxon p<0.0001
 ------------------------------------------------------------------
 By-generator accuracy (across 3 partitions × 10 seeds; each cell CE / SR(λ=1.0) / ASR):
    Generator   |          AUC(CV)            |          Brier(CV)           |          Recall(CV)          |          Iso(test)
-   g_clean     |     0.7800/0.7837/0.7837     |     0.1797/0.1779/0.1778     |     0.7121/0.7158/0.7147     |     0.4409/0.3931/0.3832
-    g_mid      |     0.7157/0.7199/0.7211     |     0.2073/0.2058/0.2053     |     0.6273/0.6305/0.6311     |     0.4493/0.3854/0.3551
-    g_hard     |     0.5858/0.5903/0.5939     |     0.2457/0.2439/0.2428     |     0.5189/0.5188/0.5185     |     0.4374/0.3404/0.2636
+   g_clean     |     0.7672/0.7709/0.7711     |     0.1836/0.1820/0.1821     |     0.7004/0.7055/0.7027     |     0.4405/0.3968/0.3802
+    g_mid      |     0.7180/0.7214/0.7229     |     0.2069/0.2056/0.2050     |     0.6281/0.6267/0.6287     |     0.4556/0.3894/0.3644
+    g_hard     |     0.5868/0.5917/0.5958     |     0.2457/0.2439/0.2426     |     0.5202/0.5213/0.5218     |     0.4277/0.3328/0.2568
 ------------------------------------------------------------------
 Training-side block-wise adaptive λ* selection distribution (all blocks, all simulations):
-  λ=0.0: 5 blocks, λ=0.5: 16 blocks, λ=1.0: 31 blocks, λ=1.5: 43 blocks, λ=2.0: 47 blocks,
-  λ=2.5: 27 blocks, λ=3.0: 8 blocks, λ=3.5: 3 blocks
+  λ=0.0: 100 blocks, λ=0.5: 66 blocks, λ=1.0: 119 blocks, λ=1.5: 188 blocks, λ=2.0: 218 blocks,
+  λ=2.5: 165 blocks, λ=3.0: 58 blocks, λ=3.5: 17 blocks
 ------------------------------------------------------------------
 Key points: all models use 7:2:1 split + validation early stopping (max 1000 rounds, consistent with the paper).
-The ASR gain over CE increases monotonically with difficulty (spatial-CV ΔAUC +0.0037 / +0.0054 /
-+0.0081, all paired tests significant), with no degradation in discriminative accuracy; spatial
-metrics (Moran's I / ContED / Iso ratio, consistent with the paper) improve across the board
-(isolated-pixel ratio drops 17.4 percentage points in the hard setting); gating-band gains
-CE∈[0.4,0.6] are ~4–5× the global gain (test ΔAUC 0.0238 vs 0.0044; spatial CV 0.0245 vs 0.0058,
-validating the gating design); λ* adapts to data difficulty (means 1.23 / 1.60 / 2.17).
+The ASR gain over CE increases monotonically with difficulty (spatial-CV ΔAUC +0.0039 / +0.0050 /
++0.0090, all per-tier paired tests significant), with no degradation in discriminative accuracy;
+spatial metrics (Moran's I / ContED / Iso ratio, consistent with the paper) improve across the board
+(isolated-pixel ratio drops 17.1 percentage points in the hard setting); gating-band gains
+CE∈[0.4,0.6] are ~3.5–5× the global gain (test ΔAUC 0.0252 vs 0.0050; spatial CV 0.0210 vs 0.0060,
+validating the gating design); λ* adapts to data difficulty (means 1.25 / 1.44 / 2.18).
 
 ## About This Repository (Demo Positioning)
 
