@@ -1111,16 +1111,12 @@ def run_study(args, lam_grid):
         d = np.mean(cv_agg['ASR'][mname] - cv_agg['CE'][mname])
         print(f'平均改善 (ASR − CE, 空间CV): Δ{mname} {d:+.4f}')
     print('-' * 74)
-    # 子集增益：只在 ASR 实际生效（λ*>0）或门控最强（CE∈[0.4,0.6] 风险带）
-    # 的像元池上算 ASR−CE（pooled，跨模拟平均；每模拟池 <50 样本则跳过）
-    band = (0.4, 0.6)
+    # 子集增益：只在 ASR 实际生效（λ*>0）的像元池上算 ASR−CE
+    # （pooled，跨模拟平均；每模拟池 <50 样本则跳过）
     subsets = [
         ('仅λ*>0区域',
          lambda r, te: r['lam_map'][te] > 0.0,
          lambda pts: pts['lam'] > 0.0),
-        (f'CE∈[{band[0]:.1f},{band[1]:.1f}]',
-         lambda r, te: (r['p_ce'][te] >= band[0]) & (r['p_ce'][te] <= band[1]),
-         lambda pts: (pts['CE'] >= band[0]) & (pts['CE'] <= band[1])),
     ]
     print('子集增益（ASR − CE，仅在子集像元池上；跨模拟平均）:')
     for tag, cond_t, cond_c in subsets:
@@ -1153,6 +1149,91 @@ def run_study(args, lam_grid):
                       f'ΔLogLoss {np.mean(dL):+.4f}')
             else:
                 print(f'  {src} {tag:<12}: 无足够样本')
+    print('-' * 74)
+    # 按 CE 预测概率分层精度表（行=指标，列=难度×概率带，格式对齐
+    # 论文 tab:simulation_strata）。每个难度独立聚合（跨该难度所有模拟）；
+    # Brier/AUC 为空间 CV 指标（cv_pts），Recall 为全量验证（测试集 te），
+    # 与论文其它表口径一致；跨模拟 mean±std；Δ=ASR−CE，括号内为配对 Wilcoxon p。
+    from scipy import stats as _stats
+    _gen_labels = {'g_clean': 'Easy', 'g_mid': 'Medium', 'g_hard': 'Hard'}
+    def _strata_table():
+        gens = [g for g in ('g_clean', 'g_mid', 'g_hard')
+                if any(r['gname'] == g for r in results)]
+        bands = [('<0.45', lambda c: c < 0.45),
+                 ('[0.45,0.55]', lambda c: (c >= 0.45) & (c <= 0.55)),
+                 ('[0.40,0.60]', lambda c: (c >= 0.40) & (c <= 0.60)),
+                 ('>0.55', lambda c: c > 0.55),
+                 ('ALL', lambda c: np.ones(len(c), bool))]
+        agg = {}
+        for g in gens:
+            rs = [r for r in results if r['gname'] == g]
+            for blab, bcond in bands:
+                b_ce, b_sr, b_asr, a_ce, a_asr, r_ce, r_asr, d_ar, d_auc, d_ll, d_rec = \
+                    [], [], [], [], [], [], [], [], [], [], []
+                for r in rs:
+                    # Brier/AUC：空间 CV（cv_pts）；Recall：全量验证（测试集 te）
+                    p = r['cv_pts']
+                    y, ce, sr, ar = p['y'], p['CE'], p['SR'], p['ASR']
+                    m = bcond(ce)
+                    if int(m.sum()) == 0:
+                        continue
+                    yb, cb, sb, ab = y[m], ce[m], sr[m], ar[m]
+                    b_ce.append(brier_score(yb, cb))
+                    b_sr.append(brier_score(yb, sb))
+                    b_asr.append(brier_score(yb, ab))
+                    a_ce.append(auc_score(yb, cb))
+                    a_asr.append(auc_score(yb, ab))
+                    d_ar.append(brier_score(yb, ab) - brier_score(yb, cb))
+                    d_auc.append(auc_score(yb, ab) - auc_score(yb, cb))
+                    d_ll.append(logloss_score(yb, ab) - logloss_score(yb, cb))
+                    te = r['te']
+                    yt, cet, art = r['y'][te], r['p_ce'][te], r['p_asr_b'][te]
+                    mt = bcond(cet)
+                    if int(mt.sum()) == 0:
+                        r_ce.append(np.nan); r_asr.append(np.nan); d_rec.append(np.nan)
+                    else:
+                        ytb, ctb, atb = yt[mt], cet[mt], art[mt]
+                        r_ce.append(recall_score(ytb, ctb))
+                        r_asr.append(recall_score(ytb, atb))
+                        d_rec.append(recall_score(ytb, atb) - recall_score(ytb, ctb))
+                agg[(g, blab)] = (b_ce, b_sr, b_asr, a_ce, a_asr, r_ce, r_asr,
+                                  d_ar, d_auc, d_ll, d_rec)
+        def _ms(x):
+            x = np.asarray(x, dtype=float)
+            x = x[~np.isnan(x)]
+            return f'{np.mean(x):.4f}'
+        def _d(x):
+            x = np.asarray(x, dtype=float)
+            x = x[~np.isnan(x)]
+            if len(x) >= 3 and np.any(x != 0.0):
+                return f'{np.mean(x):+.4f} ({_stats.wilcoxon(x)[1]:.1e})'
+            return f'{np.mean(x):+.4f} (n/a)'
+        show_bands = ['[0.45,0.55]', '[0.40,0.60]']
+        print('按 CE 预测概率分层精度表（Brier/AUC 空间CV、Recall 测试集；行=指标，列=难度×概率带；'
+              '跨模拟均值；Δ=ASR−CE，括号内为配对 Wilcoxon p）:')
+        hdr1 = [''] + sum(([_gen_labels.get(g, g)] + [''] * (len(show_bands) - 1) for g in gens), [])
+        hdr2 = [''] + [blab for g in gens for blab in show_bands]
+        _rows = [hdr1, hdr2]
+        for rname, key, fmt in [
+                ('Brier (CE)', 0, _ms), ('Brier (SR)', 1, _ms), ('Brier (ASR)', 2, _ms),
+                ('AUC (CE)', 3, _ms), ('AUC (ASR)', 4, _ms),
+                ('Recall (CE)', 5, _ms), ('Recall (ASR)', 6, _ms),
+                ('ΔBrier', 7, _d), ('ΔAUC', 8, _d), ('ΔLogL', 9, _d), ('ΔRecall', 10, _d)]:
+            cells = [rname]
+            for g in gens:
+                for blab in show_bands:
+                    cells.append(fmt(agg[(g, blab)][key]))
+            _rows.append(cells)
+        widths = [max(_disp_w(str(r[i])) for r in _rows) + 1
+                  for i in range(len(_rows[0]))]
+        for r in _rows:
+            print('  ' + _row(r, widths))
+        # 其余带作为 sanity 校验（阈值 0.5 分层正确性），一行备注
+        def _rec_mean(blab):
+            return '/'.join(f'{np.mean(agg[(g, blab)][5]):.4f}' for g in gens)
+        print('  分层 sanity（跨模拟均值 Recall(CE)）: <0.45 = ' + _rec_mean('<0.45') +
+              ' | >0.55 = ' + _rec_mean('>0.55') + ' | ALL = ' + _rec_mean('ALL'))
+    _strata_table()
     print('-' * 74)
     # 配对显著性：每模拟 Δ = ASR − CE，配对 t + Wilcoxon 符号秩
     from scipy import stats
