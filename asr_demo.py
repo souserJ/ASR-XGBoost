@@ -1233,6 +1233,20 @@ def run_study(args, lam_grid):
             return '/'.join(f'{np.mean(agg[(g, blab)][5]):.4f}' for g in gens)
         print('  分层 sanity（跨模拟均值 Recall(CE)）: <0.45 = ' + _rec_mean('<0.45') +
               ' | >0.55 = ' + _rec_mean('>0.55') + ' | ALL = ' + _rec_mean('ALL'))
+        # 跨难度综合（pooled，90 模拟）：论文表8 口径，band 在表头
+        print('  跨难度综合（3 档难度 pooled，90 模拟；论文表8 口径）:')
+        _pool = {blab: [np.concatenate([agg[(g, blab)][k] for g in gens])
+                        for k in range(11)] for blab in ('[0.45,0.55]', '[0.40,0.60]')}
+        _rows = [['', '[0.45,0.55]', '[0.40,0.60]']]
+        for rname, key, fmt in [
+                ('Brier(CV) CE', 0, _ms), ('Brier(CV) ASR', 2, _ms),
+                ('AUC(CV) CE', 3, _ms), ('AUC(CV) ASR', 4, _ms),
+                ('Recall CE', 5, _ms), ('Recall ASR', 6, _ms),
+                ('ΔBrier(CV)', 7, _d), ('ΔAUC(CV)', 8, _d), ('ΔRecall', 10, _d)]:
+            _rows.append([rname] + [fmt(_pool[blab][key]) for blab in ('[0.45,0.55]', '[0.40,0.60]')])
+        _w = [max(_disp_w(str(r[i])) for r in _rows) + 1 for i in range(3)]
+        for r in _rows:
+            print('  ' + _row(r, _w))
     _strata_table()
     print('-' * 74)
     # 配对显著性：每模拟 Δ = ASR − CE，配对 t + Wilcoxon 符号秩
