@@ -687,6 +687,12 @@ def build_spatial_folds(block_ids, y, n_folds=5, min_samples=10, seed=42):
     return point_fold
 
 
+# 分层精度表（论文表8）的概率带定义：(名称, lo, hi)，lo/hi 为 None 表示开区间
+STRATA_BANDS = [('<0.45', None, 0.45), ('[0.45,0.55]', 0.45, 0.55),
+                ('[0.40,0.60]', 0.40, 0.60), ('>0.55', 0.55, None),
+                ('ALL', None, None)]
+
+
 def spatial_cv_evaluate(X, y, fit_idx, grid_labels, R, beta, params, num_round,
                         lam_map, n_folds=5, min_samples=10, fold_seed=42,
                         early_stop=50):
@@ -694,14 +700,18 @@ def spatial_cv_evaluate(X, y, fit_idx, grid_labels, R, beta, params, num_round,
 
     每折：折内训练集重训 CE → 全图重算软标签/门控（无泄漏）→
     ASR 用训练侧预选 λ*（lam_map 逐像元，与测试集口径一致，无 oracle）。
-    返回 (per_fold, pts)：per_fold 每折 (brier, auc, logloss, recall)；
-    pts 收集全部测试折像元的 y/CE/SR/ASR/lam（供子集增益分析）。"""
+    返回 (per_fold, pts, band_fold)：per_fold 每折整体 (brier, auc, logloss, recall)；
+    pts 收集全部测试折像元的 y/CE/SR/ASR/lam（供子集增益分析）；
+    band_fold[(m, bname)] = 每折 band 内 (brier, auc, recall)（按该折 CE 预测分层，
+    fold-avg 口径，供论文表8）。"""
     block_ids = grid_labels[fit_idx]
     point_fold = build_spatial_folds(block_ids, y[fit_idx], n_folds,
                                      min_samples, fold_seed)
     n = int(round(np.sqrt(len(X))))
     dX = xgb.DMatrix(X)
     per_fold = {m: [] for m in ('CE', 'SR(λ=1.0)', 'ASR')}
+    band_fold = {(m, bname): [] for m in ('CE', 'SR(λ=1.0)', 'ASR')
+                 for bname, _, _ in STRATA_BANDS}
     pts = {'y': [], 'CE': [], 'SR': [], 'ASR': [], 'lam': []}
     for f in range(n_folds):
         test_pts = fit_idx[point_fold == f]
@@ -743,18 +753,40 @@ def spatial_cv_evaluate(X, y, fit_idx, grid_labels, R, beta, params, num_round,
                                 auc_score(y_te, p_asr_te),
                                 logloss_score(y_te, p_asr_te),
                                 recall_score(y_te, p_asr_te)))
+        # band 内指标（按该折 CE 预测分层；fold-avg 口径，供论文表8）
+        for bname, lo, hi in STRATA_BANDS:
+            msk = np.ones(len(y_te), bool)
+            if lo is not None:
+                msk &= (p_ce_te >= lo)
+            if hi is not None:
+                msk &= (p_ce_te <= hi)
+            if int(msk.sum()) == 0:
+                continue
+            yb = y_te[msk]
+            band_fold[('CE', bname)].append((brier_score(yb, p_ce_te[msk]),
+                                             auc_score(yb, p_ce_te[msk]),
+                                             logloss_score(yb, p_ce_te[msk]),
+                                             recall_score(yb, p_ce_te[msk])))
+            band_fold[('SR(λ=1.0)', bname)].append((brier_score(yb, p_sr10_te[msk]),
+                                                     auc_score(yb, p_sr10_te[msk]),
+                                                     logloss_score(yb, p_sr10_te[msk]),
+                                                     recall_score(yb, p_sr10_te[msk])))
+            band_fold[('ASR', bname)].append((brier_score(yb, p_asr_te[msk]),
+                                              auc_score(yb, p_asr_te[msk]),
+                                              logloss_score(yb, p_asr_te[msk]),
+                                              recall_score(yb, p_asr_te[msk])))
         pts['y'].append(y_te)
         pts['CE'].append(p_ce_te)
         pts['SR'].append(p_sr10_te)
         pts['ASR'].append(p_asr_te)
         pts['lam'].append(lam_map[test_pts])
-    return per_fold, pts
+    return per_fold, pts, band_fold
 
 
 # ==========================================================================
 # 6. 主流程
 # ==========================================================================
-CACHE_VERSION = 'v3'   # 缓存结构版本（v3: tr 训练 + va 早停协议）；改结构需递增
+CACHE_VERSION = 'v4'   # 缓存结构版本（v4: cv_bands 每折 band 内指标，fold-avg 口径）；改结构需递增
 def main():
     ap = argparse.ArgumentParser(description='ASR-XGBoost minimal demo')
     ap.add_argument('--beta', type=float, default=2.0)
@@ -855,7 +887,7 @@ def main():
         # 每折重训 CE 并重算软标签/门控（无泄漏）；ASR 用训练侧预选 λ*（公平版）。
         print('>> final 式空间 CV 评估（3×3 网格块折）…', flush=True)
         glab = grid_blocks(n, 3).ravel()
-        per_fold, _ = spatial_cv_evaluate(out['Xall'], out['y'], out['trva'], glab,
+        per_fold, _, _ = spatial_cv_evaluate(out['Xall'], out['y'], out['trva'], glab,
                                           out['R'], args.beta,
                                           dict(objective='binary:logistic', eta=0.1,
                                                max_depth=4, subsample=0.8,
@@ -984,6 +1016,7 @@ def _cache_entry(out):
     return dict(gname=out['gname'], pname=out['pname'], seed=out['seed'],
                 n_blocks=out['n_blocks'], lam_star=out['lam_star'], n=out['n'],
                 test=out['test'], cv=out['cv'], cv_pts=out['cv_pts'],
+                cv_bands=out['cv_bands'],
                 te=out['te'], y=out['y'], p_ce=out['p_ce'],
                 p_asr_b=out['p_asr_b'], lam_map=out['lam_map'])
 
@@ -1050,14 +1083,19 @@ def run_study(args, lam_grid):
                                         early_stop=args.early_stop)
                     # final 式空间 CV（3×3 网格块折，每折重训+重算软标签，无泄漏）
                     glab = grid_blocks(out['n'], 3).ravel()
-                    pf, pts = spatial_cv_evaluate(out['Xall'], out['y'], out['trva'], glab,
-                                                  out['R'], args.beta, params,
-                                                  args.num_round,
-                                                  out['lam_map'],
-                                                  n_folds=args.cv_folds,
-                                                  early_stop=args.early_stop)
+                    pf, pts, bf = spatial_cv_evaluate(out['Xall'], out['y'], out['trva'], glab,
+                                                      out['R'], args.beta, params,
+                                                      args.num_round,
+                                                      out['lam_map'],
+                                                      n_folds=args.cv_folds,
+                                                      early_stop=args.early_stop)
                     out['cv'] = {m: np.asarray(pf[m]).mean(axis=0)
                                  for m in ('CE', 'SR(λ=1.0)', 'ASR')}
+                    out['cv_bands'] = {m: {
+                        bname: (np.asarray(bf[(m, bname)]).mean(axis=0)
+                                if bf[(m, bname)] else (np.nan,) * 4)
+                        for bname, _, _ in STRATA_BANDS}
+                        for m in ('CE', 'SR(λ=1.0)', 'ASR')}
                     out['cv_pts'] = {k: np.concatenate(v) for k, v in pts.items()}
                     cache[key] = _cache_entry(out)
                     cached = False
@@ -1171,21 +1209,16 @@ def run_study(args, lam_grid):
                 b_ce, b_sr, b_asr, a_ce, a_asr, r_ce, r_asr, d_ar, d_auc, d_ll, d_rec = \
                     [], [], [], [], [], [], [], [], [], [], []
                 for r in rs:
-                    # Brier/AUC：空间 CV（cv_pts）；Recall：全量验证（测试集 te）
-                    p = r['cv_pts']
-                    y, ce, sr, ar = p['y'], p['CE'], p['SR'], p['ASR']
-                    m = bcond(ce)
-                    if int(m.sum()) == 0:
-                        continue
-                    yb, cb, sb, ab = y[m], ce[m], sr[m], ar[m]
-                    b_ce.append(brier_score(yb, cb))
-                    b_sr.append(brier_score(yb, sb))
-                    b_asr.append(brier_score(yb, ab))
-                    a_ce.append(auc_score(yb, cb))
-                    a_asr.append(auc_score(yb, ab))
-                    d_ar.append(brier_score(yb, ab) - brier_score(yb, cb))
-                    d_auc.append(auc_score(yb, ab) - auc_score(yb, cb))
-                    d_ll.append(logloss_score(yb, ab) - logloss_score(yb, cb))
+                    # Brier/AUC：空间 CV，fold-avg 口径（cv_bands：每折 band 内指标取平均）；
+                    # Recall：全量验证（测试集 te），与论文其它表一致
+                    cb = r['cv_bands']['CE'][blab]
+                    sb = r['cv_bands']['SR(λ=1.0)'][blab]
+                    ab = r['cv_bands']['ASR'][blab]
+                    b_ce.append(cb[0]); b_sr.append(sb[0]); b_asr.append(ab[0])
+                    a_ce.append(cb[1]); a_asr.append(ab[1])
+                    d_ar.append(ab[0] - cb[0])
+                    d_auc.append(ab[1] - cb[1])
+                    d_ll.append(ab[2] - cb[2])
                     te = r['te']
                     yt, cet, art = r['y'][te], r['p_ce'][te], r['p_asr_b'][te]
                     mt = bcond(cet)
@@ -1236,15 +1269,17 @@ def run_study(args, lam_grid):
         # 跨难度综合（pooled，90 模拟）：论文表8 口径，band 在表头
         print('  跨难度综合（3 档难度 pooled，90 模拟；论文表8 口径）:')
         _pool = {blab: [np.concatenate([agg[(g, blab)][k] for g in gens])
-                        for k in range(11)] for blab in ('[0.45,0.55]', '[0.40,0.60]')}
-        _rows = [['', '[0.45,0.55]', '[0.40,0.60]']]
+                        for k in range(11)]
+                 for blab in ('[0.45,0.55]', '[0.40,0.60]', 'ALL')}
+        _rows = [['', '[0.45,0.55]', '[0.40,0.60]', 'ALL']]
         for rname, key, fmt in [
                 ('Brier(CV) CE', 0, _ms), ('Brier(CV) ASR', 2, _ms),
                 ('AUC(CV) CE', 3, _ms), ('AUC(CV) ASR', 4, _ms),
                 ('Recall CE', 5, _ms), ('Recall ASR', 6, _ms),
                 ('ΔBrier(CV)', 7, _d), ('ΔAUC(CV)', 8, _d), ('ΔRecall', 10, _d)]:
-            _rows.append([rname] + [fmt(_pool[blab][key]) for blab in ('[0.45,0.55]', '[0.40,0.60]')])
-        _w = [max(_disp_w(str(r[i])) for r in _rows) + 1 for i in range(3)]
+            _rows.append([rname] + [fmt(_pool[blab][key])
+                                    for blab in ('[0.45,0.55]', '[0.40,0.60]', 'ALL')])
+        _w = [max(_disp_w(str(r[i])) for r in _rows) + 1 for i in range(4)]
         for r in _rows:
             print('  ' + _row(r, _w))
     _strata_table()
