@@ -5,3 +5,5 @@ study_cache.pkl
 *.pkl
 demo_result.png
 demo_result_small.jpg
+regions.npy
+study_cache.pkl.bak*

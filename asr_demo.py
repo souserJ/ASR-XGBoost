@@ -12,8 +12,7 @@ ASR-XGBoost 最小演示版 (Minimal Demo) —— 多情形模拟研究
   - 阻力面:     地形山脊 + 噪声（Zeller et al. 2012 阻力面构建惯例）
   - 适宜性:     协变量响应函数（virtual species 模拟惯例,
                 Hirzel et al. 2001; Meynard & Kaplan 2012; Leroy et al. 2016）
-  - 观测标签:   ① 伯努利出现采样 + 分块检测/报告异质性噪声（漏报的代理,
-                呼应 presence-only 数据局限）;
+  - 观测标签:   ① 伯努利出现采样 + 分块检测/报告异质性噪声（报告/检测能力空间异质性的对称噪声代理——对不对称漏报的简化近似，非直接建模）;
                 ② 点过程模式: 非齐次泊松/LGCP —— 像元事件数 ~ Poisson(λ(s)),
                 出现 = 至少 1 个事件, λ(s) = ν·e^{0.6Z(s)}·p_true。
 
@@ -511,7 +510,7 @@ GENERATIONS = {
     'g_mid':     dict(name='伯努利·中等噪声', mode='bernoulli',
                       noise_base=0.22, noise_diff=0.02, ridge=3.0, len_scale=18.0,
                       frag=0.0, ocean=True),
-    'g_noisy':   dict(name='伯努利·高漏报异质性', mode='bernoulli',
+    'g_noisy':   dict(name='伯努利·高块间噪声异质性', mode='bernoulli',
                       noise_base=0.05, noise_diff=0.30, ridge=3.0, len_scale=18.0,
                       frag=1.5, ocean=True),
     'g_noisy2':  dict(name='伯努利·全块高噪声', mode='bernoulli',
@@ -1053,7 +1052,7 @@ def run_study(args, lam_grid):
         try:
             with open(cache_path, 'rb') as f:
                 cache = pickle.load(f)
-            # 仅复用当前版本（v2）的条目；旧版本条目保留在文件中不删除，
+            # 仅复用与当前 CACHE_VERSION 匹配的条目；旧版本条目保留在文件中不删除，
             # 避免写回时无谓覆盖丢失（版本不兼容时 key 自然不匹配，不会误用）
             n_ok = sum(1 for k in cache if k.startswith(CACHE_VERSION + '|'))
             print(f'[Cache] 加载 {len(cache)} 条（当前版本可复用 {n_ok} 条）: {cache_path}')
@@ -1099,6 +1098,13 @@ def run_study(args, lam_grid):
                     out['cv_pts'] = {k: np.concatenate(v) for k, v in pts.items()}
                     cache[key] = _cache_entry(out)
                     cached = False
+                    # 逐条写盘：中断后重跑可断点续跑（已完成的模拟直接命中）
+                    if not args.no_cache:
+                        try:
+                            with open(cache_path, 'wb') as f:
+                                pickle.dump(cache, f)
+                        except Exception:
+                            print('[Cache] 写盘失败（继续，内存中保留）', flush=True)
                 results.append(out)
                 i += 1
                 print(f'[{i}/{total}] {gname} × {pname} × seed={seed} '

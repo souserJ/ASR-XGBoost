@@ -17,7 +17,7 @@
 | 环境变量场 X1~X3 | **GSTools** Matern 高斯随机场，**嵌套双尺度**（长程趋势 + 局地变异），3 个协变量 |
 | 阻力面 R | 地形山脊 + 噪声；**曲折海岸线**（多正弦叠加，阻力=100 绝对屏障） |
 | 适宜性 p_true | 协变量响应函数 + **交互项**（非线性空间结构）；碎片块叠加可学习锐边 |
-| 观测标签 y | ① 伯努利出现采样 + 分块检测/报告异质性噪声（**漏报的代理**）；② 点过程模式：**LGCP/非齐次泊松**（像元事件数~Poisson(λ(s))，出现=至少 1 事件） |
+| 观测标签 y | ① 伯努利出现采样 + 分块检测/报告异质性噪声（**报告/检测能力空间异质性的对称噪声代理，非不对称漏报的直接建模**）；② 点过程模式：**LGCP/非齐次泊松**（像元事件数~Poisson(λ(s))，出现=至少 1 事件） |
 
 ## 核心方法
 
@@ -49,7 +49,7 @@ pip install -r requirements.txt
 python asr_demo.py                          # 单次详细演示（300×300, 16 块, 40% 采样, 空间 CV 评估与六联图：真值/分块/λ*/CE/ASR/差值）
 python asr_demo.py --study                    # 模拟研究：三档难度 × 3 分块 × 2 种子 = 18 次（默认 16 块 / min-pixels 150；逐模拟缓存）
 python asr_demo.py --study --gens g_clean     # 只跑简单：低噪声
-python asr_demo.py --study --gens g_mid       # 只跑中等：全块 σ≈0.22 中等噪声
+python asr_demo.py --study --gens g_mid       # 只跑中等：全块 σ≈0.23 中等噪声
 python asr_demo.py --study --gens g_hard      # 只跑困难：弱信号 + 高噪声
 python asr_demo.py --study --reps 10   # 正式口径（16 块 / min-pixels 150 已是默认值），三档全跑，配对显著性（推荐）
 python asr_demo.py --study --reps 3           # 增加重复种子数
@@ -69,7 +69,7 @@ python asr_demo.py --blocks regions.npy
 
 设计：默认 **三档难度（g_clean 简单 / g_mid 中等 / g_hard 困难）× 3 种分块方式 × 2 个种子 = 18 次模拟**，分块为 **16 块 / `--min-pixels 150`** 正式默认（`--gens` 可选单一难度或加入其他生成器）。每次模拟同时输出**测试集**指标（AUC / Brier / Recall 与空间指标 Moran's I / ContED / Iso ratio，与论文 External validation 表指标行一致）与 **final 式空间 CV** 指标（3×3 网格块折，块不跨折，每折重训并重算软标签/门控，无泄漏；ASR 默认用**训练侧预选 λ\***（公平版，与测试集同口径）），最后聚合平均（mean±std）并给出 ASR 相对 CE 的平均改善。另输出**子集增益**：仅在 λ\*>0 区域（ASR 实际生效）与 CE∈[0.4,0.6] 风险带（门控最强）的像元池上的 ASR−CE 改善。命名与论文一致：SR(λ=1.0)（固定强度）、ASR（分块自适应）。
 
-- 数据生成（按难度分档）：`g_clean`（**简单**：低噪声）/ `g_mid`（**中等**：全块 σ≈0.22 中等噪声）/ `g_hard`（**困难**：弱信号 logit×0.45 + σ≈0.35，CE 预测大量接近 0.5，放大 ASR 门控收益）；其他生成器：`g_noisy`（高漏报异质性）/ `g_noisy2`（全块高噪声）/ `g_barrier`（强地形屏障）/ `g_lgcp`（点过程 LGCP）
+- 数据生成（按难度分档）：`g_clean`（**简单**：低噪声）/ `g_mid`（**中等**：全块 σ≈0.23 中等噪声）/ `g_hard`（**困难**：弱信号 logit×0.45 + σ≈0.36，CE 预测大量接近 0.5，放大 ASR 门控收益）；其他生成器：`g_noisy`（高块间噪声异质性）/ `g_noisy2`（全块高噪声）/ `g_barrier`（强地形屏障）/ `g_lgcp`（点过程 LGCP）
 - 分块方式：`p_voronoi`（Voronoi 随机国家块）/ `p_grid`（规则网格块，对应 5°×5° 网格惯例）/ `p_resist`（生态阻力分区）
 - 输出：逐次模拟进度（缓存/重跑标记）→ 测试集汇总表 → 空间 CV 汇总表 → 平均改善 → 子集增益 → 配对显著性（每模拟 Δ = ASR−CE，配对 t + Wilcoxon）→ 按 生成×分块 组合表（测试集 + 空间CV）→ λ\* 选择分布
 - **缓存**：逐模拟结果存 `study_cache.pkl`（key 含全部参数，改参数自动失效）；二次运行命中缓存秒出；`--no-cache` 强制重跑

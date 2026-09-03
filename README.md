@@ -19,7 +19,7 @@ Building on standard pixel-wise XGBoost, spatial continuity is embedded directly
 | Environmental fields X1~X3 | **GSTools** Matern Gaussian random fields, **nested dual-scale** (long-range trend + local variation), 3 covariates |
 | Resistance surface R | Terrain ridges + noise; **sinuous coastline** (superposed sinusoids, resistance = 100 absolute barrier) |
 | Suitability p_true | Covariate response functions + **interaction term** (nonlinear spatial structure); superimposed fragment patches for learnable sharp edges |
-| Observed labels y | ① Bernoulli occurrence sampling + block-wise detection/reporting heterogeneity noise (**proxy for under-reporting**); ② point-process pattern: **LGCP/inhomogeneous Poisson** (pixel event count ~ Poisson(λ(s)); occurrence = at least 1 event) |
+| Observed labels y | ① Bernoulli occurrence sampling + block-wise detection/reporting heterogeneity noise (**symmetric proxy for spatially heterogeneous reporting capacity (not a model of asymmetric underreporting)**); ② point-process pattern: **LGCP/inhomogeneous Poisson** (pixel event count ~ Poisson(λ(s)); occurrence = at least 1 event) |
 
 ## Core Method
 
@@ -51,7 +51,7 @@ pip install -r requirements.txt
 python asr_demo.py                          # single detailed demo (300×300, 16 blocks, 40% sampling, spatial CV evaluation and 6-panel figure: truth/blocks/λ*/CE/ASR/difference)
 python asr_demo.py --study                    # simulation study: 3 difficulty levels × 3 partitions × 2 seeds = 18 runs (defaults: 16 blocks, min-pixels 150; per-simulation cache)
 python asr_demo.py --study --gens g_clean     # easy only: low noise
-python asr_demo.py --study --gens g_mid       # medium only: full-block σ≈0.22 moderate noise
+python asr_demo.py --study --gens g_mid       # medium only: full-block σ≈0.23 moderate noise
 python asr_demo.py --study --gens g_hard      # hard only: weak signal + high noise
 python asr_demo.py --study --reps 10   # formal protocol (16 blocks / min-pixels 150 are the defaults), paired significance (recommended)
 python asr_demo.py --study --reps 3           # increase number of seeds
@@ -71,7 +71,7 @@ python asr_demo.py --blocks regions.npy
 
 Design: default **three difficulty levels (g_clean / g_mid / g_hard) × 3 block partitions × 2 seeds = 18 simulations**, with **16 spatial blocks and `--min-pixels 150`** as the formal defaults (`--gens` to select a single difficulty or add other generators). Each simulation reports both **test-set** metrics (AUC / Brier / Recall plus spatial metrics Moran's I / ContED / Iso ratio, matching the indicator rows of the paper's External validation table) and **final-style spatial CV** metrics (3×3 grid-block folds, blocks never split across folds, each fold retrains and recomputes soft labels/gating, no leakage; ASR uses **training-side preselected λ\*** by default (fair version, same protocol as the test set)), then aggregates mean±std and reports the average ASR improvement over CE. Additionally reports **subset gains**: the ASR−CE improvement restricted to pixels where λ\*>0 (where ASR is actually active) and to the CE∈[0.4,0.6] risk band (strongest gating). Naming matches the paper: SR(λ=1.0) (fixed strength), ASR (block-wise adaptive).
 
-- Data generators (by difficulty): `g_clean` (**easy**: low noise) / `g_mid` (**medium**: full-block σ≈0.22 moderate noise) / `g_hard` (**hard**: weak signal logit×0.45 + σ≈0.35, CE predictions largely near 0.5, amplifying the ASR gating gain); other generators: `g_noisy` (high under-reporting heterogeneity) / `g_noisy2` (full-block high noise) / `g_barrier` (strong terrain barrier) / `g_lgcp` (point-process LGCP)
+- Data generators (by difficulty): `g_clean` (**easy**: low noise) / `g_mid` (**medium**: full-block σ≈0.23 moderate noise) / `g_hard` (**hard**: weak signal logit×0.45 + σ≈0.36, CE predictions largely near 0.5, amplifying the ASR gating gain); other generators: `g_noisy` (high block-level noise heterogeneity) / `g_noisy2` (full-block high noise) / `g_barrier` (strong terrain barrier) / `g_lgcp` (point-process LGCP)
 - Block partitions: `p_voronoi` (Voronoi random "country" blocks) / `p_grid` (regular grid blocks, corresponding to the 5°×5° grid convention) / `p_resist` (ecological resistance partitions)
 - Output: per-simulation progress (cache/rerun markers) → test-set summary table → spatial CV summary table → mean improvement → subset gains → paired significance (per-simulation Δ = ASR−CE, paired t + Wilcoxon) → generator × partition combination table (test set + spatial CV) → λ\* selection distribution
 - **Cache**: per-simulation results stored in `study_cache.pkl` (keys include all parameters; parameter changes invalidate automatically); reruns hit the cache in seconds; `--no-cache` forces a full rerun
