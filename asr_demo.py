@@ -531,6 +531,131 @@ PARTITIONS = {
     'p_resist':  '生态阻力分区（阻力分位）',
 }
 
+# ==========================================================================
+# 4.4 模型臂注册表（臂级增量缓存机制的核心）
+# ==========================================================================
+# 加新臂 = 在 ARMS 里加一行，然后照常跑 --study：
+#   已缓存的模拟条目会自动“只补算缺失臂”（测试划分训练一次 + 空间CV 每折一次），
+#   不会重跑数据生成 / CE 基线 / 软标签 / 分块 λ* 选择 / 折内 CE 等昂贵部分。
+# type: 'ce' = 无正则 CE 基线；'sr' = 固定强度正则（需 lam）；'asr' = 分块自适应（用 lam_map）
+# 默认三臂 = 论文模拟口径（CE / SR(λ=1.0) / ASR）。
+ARMS = [
+    dict(key='CE',   disp='CE',        type='ce'),
+    dict(key='SRg1', disp='SR(λ=1.0)', type='sr', lam=1.0),
+    dict(key='ASRb', disp='ASR',       type='asr'),
+]
+ARMS_DISP = [a['disp'] for a in ARMS]
+
+
+def _arm_test_metrics(p_full, y, te, n, land_mask):
+    """测试集指标元组 (AUC, Brier, Moran, ContED, Iso, LogLoss, Recall)，与 simulate_once 同口径。"""
+    moran, conted, iso = spatial_metrics(p_full.reshape(n, n), land_mask)
+    return (auc_score(y[te], p_full[te]), brier_score(y[te], p_full[te]),
+            moran, conted, iso, logloss_score(y[te], p_full[te]),
+            recall_score(y[te], p_full[te]))
+
+
+def _missing_arms(out):
+    """缓存条目缺失的臂（test/cv/cv_bands 任一缺即视为缺失）。"""
+    have = set(out.get('test', {})) & set(out.get('cv', {})) & set(out.get('cv_bands', {}))
+    return [a for a in ARMS if a['disp'] not in have]
+
+
+def _can_add_arms(out):
+    """条目是否带训练状态（state + 折内 CE 预测），能否增量补臂。"""
+    return 'state' in out and out.get('fold_ce')
+
+
+def _add_missing_arms(out, missing, params, args):
+    """用缓存训练状态只补算缺失臂（测试划分 + 空间CV 每折）。
+
+    折划分确定性重建（grid_blocks + build_spatial_folds，种子固定）；
+    折内 CE 全栅格预测直接用缓存（fold_ce），免重训 CE 与软标签。
+    返回补臂后的 out（原地更新 test/cv/cv_bands/cv_pts）。"""
+    st = out['state']
+    Xall, y, n = st['Xall'], st['y'], st['n']
+    tr, va, te = st['tr'], st['va'], st['te']
+    soft, delta, R = st['soft'], st['delta'], st['R']
+    land_mask, trva = st['land_mask'], st['trva']
+    beta, num_round, early_stop = args.beta, args.num_round, args.early_stop
+    dgrid = xgb.DMatrix(Xall)
+    # 缺失臂容器初始化（test 直接赋值；cv/cv_bands/cv_pts 先建空容器）
+    for a in missing:
+        if a['type'] == 'ce':
+            continue
+        out['cv'][a['disp']] = []
+        out['cv_bands'][a['disp']] = {bname: [] for bname, _, _ in STRATA_BANDS}
+        out['cv_pts'][a['disp']] = []
+    # ---- 测试划分臂（tr 训练 + va 早停，te 评估） ----
+    for a in missing:
+        if a['type'] == 'ce':
+            continue
+        obj = (make_asr_objective(delta[tr], soft[tr], a['lam']) if a['type'] == 'sr'
+               else make_asr_objective(delta[tr], soft[tr], out['lam_map'][tr]))
+        bst = _xgb_train_es(params, xgb.DMatrix(Xall[tr], label=y[tr]), num_round,
+                            xgb.DMatrix(Xall[va], label=y[va]), early_stop, obj=obj)
+        out['test'][a['disp']] = _arm_test_metrics(predict_prob(bst, dgrid),
+                                                   y, te, n, land_mask)
+    # ---- 空间 CV 每折臂（折划分重建；折内 CE 预测用缓存 fold_ce） ----
+    glab = grid_blocks(n, 3).ravel()
+    fit_idx = trva
+    point_fold = build_spatial_folds(glab[fit_idx], y[fit_idx], args.cv_folds,
+                                     min_samples=10, seed=42)
+    for f in range(args.cv_folds):
+        test_pts = fit_idx[point_fold == f]
+        if len(test_pts) == 0:
+            continue
+        train_pts = fit_idx[point_fold != f]
+        rng_f = np.random.default_rng(42 + f)
+        perm_f = rng_f.permutation(len(train_pts))
+        n_va_f = max(1, int(0.15 * len(train_pts)))
+        va_pts = train_pts[perm_f[:n_va_f]]
+        tr_pts = train_pts[perm_f[n_va_f:]]
+        p_ce_full = out['fold_ce'][f]
+        soft_f = soft_labels_8nn(p_ce_full.reshape(n, n), R, beta).ravel()
+        delta_f = gate_frozen(p_ce_full)
+        y_te = y[test_pts]
+        for a in missing:
+            if a['type'] == 'ce':
+                continue
+            obj = (make_asr_objective(delta_f[tr_pts], soft_f[tr_pts], a['lam'])
+                   if a['type'] == 'sr' else
+                   make_asr_objective(delta_f[tr_pts], soft_f[tr_pts],
+                                      out['lam_map'][tr_pts]))
+            bst = _xgb_train_es(params,
+                                xgb.DMatrix(Xall[tr_pts], label=y[tr_pts]),
+                                num_round,
+                                xgb.DMatrix(Xall[va_pts], label=y[va_pts]),
+                                early_stop, obj=obj)
+            p_te = predict_prob(bst, dgrid)[test_pts]
+            out['cv'][a['disp']].append((brier_score(y_te, p_te),
+                                         auc_score(y_te, p_te),
+                                         logloss_score(y_te, p_te),
+                                         recall_score(y_te, p_te)))
+            p_ce_te = p_ce_full[test_pts]
+            for bname, lo, hi in STRATA_BANDS:
+                msk = np.ones(len(y_te), bool)
+                if lo is not None:
+                    msk &= (p_ce_te >= lo)
+                if hi is not None:
+                    msk &= (p_ce_te <= hi)
+                if int(msk.sum()) == 0:
+                    continue
+                yb = y_te[msk]
+                out['cv_bands'][a['disp']][bname].append(
+                    (brier_score(yb, p_te[msk]), auc_score(yb, p_te[msk]),
+                     logloss_score(yb, p_te[msk]), recall_score(yb, p_te[msk])))
+            out['cv_pts'][a['disp']].append(p_te)
+    # 汇总为缓存口径：cv=折均值；cv_bands[b]=折均值（无折则 nan）；cv_pts=拼接
+    for a in missing:
+        out['cv'][a['disp']] = np.asarray(out['cv'][a['disp']]).mean(axis=0)
+        for bname, _, _ in STRATA_BANDS:
+            arr = out['cv_bands'][a['disp']][bname]
+            out['cv_bands'][a['disp']][bname] = (np.asarray(arr).mean(axis=0)
+                                                 if arr else (np.nan,) * 4)
+        out['cv_pts'][a['disp']] = np.concatenate(out['cv_pts'][a['disp']])
+    return out
+
 
 def simulate_once(gname, pname, seed, n, nblocks, min_pixels, lam_grid,
                   beta, params, num_round, cv_rounds, cv_folds,
@@ -614,12 +739,7 @@ def simulate_once(gname, pname, seed, n, nblocks, min_pixels, lam_grid,
     soft = soft_labels_8nn(p_ce_grid, R, beta, connectivity=True).ravel()
     delta = gate_frozen(p_ce)
 
-    # ASR 全局 λ（自定义目标，Brier 早停）
-    obj_g = make_asr_objective(delta[tr], soft[tr], 1.0)
-    bst_g = _xgb_train_es(params, dtr, num_round, dva, early_stop, obj=obj_g)
-    p_asr_g = predict_prob(bst_g, dgrid)
-
-    # 分块自适应 λ（块内 CV，每折早停）
+    # 分块自适应 λ（块内 CV，每折早停）——需在正则臂训练前（'asr' 臂用 lam_map）
     lab_tr = labels.ravel()[tr]
     if verbose:
         print(f'  >> 分块 λ 选择（{n_blk} 块 × {len(lam_grid)} 个 λ × '
@@ -631,25 +751,29 @@ def simulate_once(gname, pname, seed, n, nblocks, min_pixels, lam_grid,
     for b, l in lam_star.items():
         lam_map[labels.ravel() == b] = l
 
-    # ASR 分块自适应 λ
-    obj_b = make_asr_objective(delta[tr], soft[tr], lam_map[tr])
-    bst_b = _xgb_train_es(params, dtr, num_round, dva, early_stop, obj=obj_b)
-    p_asr_b = predict_prob(bst_b, dgrid)
+    # 正则臂（ARMS 驱动，自定义目标 + Brier 早停）：
+    #   'sr' = 固定强度全局 λ；'asr' = 分块自适应 λ（lam_map 逐像元）
+    _p_arms = {'CE': p_ce}
+    for _a in ARMS:
+        if _a['type'] == 'ce':
+            continue
+        _obj = (make_asr_objective(delta[tr], soft[tr], _a['lam']) if _a['type'] == 'sr'
+                else make_asr_objective(delta[tr], soft[tr], lam_map[tr]))
+        _bst = _xgb_train_es(params, dtr, num_round, dva, early_stop, obj=_obj)
+        _p_arms[_a['disp']] = predict_prob(_bst, dgrid)
 
-    # 测试集评估
+    # 测试集评估（test 键统一为臂显示名 disp）
     out = dict(gname=gname, pname=pname, seed=seed, n_blocks=n_blk,
                lam_star=lam_star, cv_rows=cv_rows, cv_curves=cv_curves,
                lam_map=lam_map, labels=labels, R=R, p_true=p_true, ocean=ocean,
-               y=y, te=te, p_ce=p_ce, p_asr_g=p_asr_g, p_asr_b=p_asr_b,
+               y=y, te=te, p_ce=p_ce, p_asr_b=_p_arms.get('ASR'),
                n=n, soft=soft, delta=delta, Xall=Xall, trva=trva)
-    out['test'] = {}
-    for name, p in [('CE', p_ce), ('ASRg', p_asr_g), ('ASRb', p_asr_b)]:
-        moran, conted, iso = spatial_metrics(p.reshape(n, n), land_mask)
-        out['test'][name] = (auc_score(y[te], p[te]),
-                             brier_score(y[te], p[te]),
-                             moran, conted, iso,
-                             logloss_score(y[te], p[te]),
-                             recall_score(y[te], p[te]))
+    out['test'] = {a['disp']: _arm_test_metrics(_p_arms[a['disp']], y, te, n, land_mask)
+                   for a in ARMS}
+    # 增量缓存所需的训练状态：加新臂时免重跑数据生成/CE/软标签/λ* 选择
+    out['state'] = dict(Xall=Xall, y=y, tr=tr, va=va, te=te, n=n,
+                        soft=soft, delta=delta, R=R,
+                        land_mask=land_mask, trva=trva)
     out['n_land'] = len(land_idx)
     out['n_dataset'] = len(ds)
     out['n_split'] = (len(tr), len(va), len(te))
@@ -694,7 +818,7 @@ STRATA_BANDS = [('<0.45', None, 0.45), ('[0.45,0.55]', 0.45, 0.55),
 
 def spatial_cv_evaluate(X, y, fit_idx, grid_labels, R, beta, params, num_round,
                         lam_map, n_folds=5, min_samples=10, fold_seed=42,
-                        early_stop=50):
+                        early_stop=50, arms=None):
     """final 式空间 CV（3×3 网格块折，块不跨折，无效块点只进训练）。
 
     每折：折内训练集重训 CE → 全图重算软标签/门控（无泄漏）→
@@ -702,16 +826,22 @@ def spatial_cv_evaluate(X, y, fit_idx, grid_labels, R, beta, params, num_round,
     返回 (per_fold, pts, band_fold)：per_fold 每折整体 (brier, auc, logloss, recall)；
     pts 收集全部测试折像元的 y/CE/SR/ASR/lam（供子集增益分析）；
     band_fold[(m, bname)] = 每折 band 内 (brier, auc, recall)（按该折 CE 预测分层，
-    fold-avg 口径，供论文表8）。"""
+    fold-avg 口径，供论文表8）。返回 (per_fold, pts, band_fold, fold_ce)：
+    fold_ce[f] = 第 f 折的 CE 全栅格预测（供增量补算新臂复用，免重训折内 CE）。"""
+    if arms is None:
+        arms = ARMS
     block_ids = grid_labels[fit_idx]
     point_fold = build_spatial_folds(block_ids, y[fit_idx], n_folds,
                                      min_samples, fold_seed)
     n = int(round(np.sqrt(len(X))))
     dX = xgb.DMatrix(X)
-    per_fold = {m: [] for m in ('CE', 'SR(λ=1.0)', 'ASR')}
-    band_fold = {(m, bname): [] for m in ('CE', 'SR(λ=1.0)', 'ASR')
+    per_fold = {a['disp']: [] for a in arms}
+    band_fold = {(a['disp'], bname): [] for a in arms
                  for bname, _, _ in STRATA_BANDS}
-    pts = {'y': [], 'CE': [], 'SR': [], 'ASR': [], 'lam': []}
+    pts = {'y': [], 'lam': []}
+    for a in arms:
+        pts[a['disp']] = []
+    fold_ce = {}
     for f in range(n_folds):
         test_pts = fit_idx[point_fold == f]
         if len(test_pts) == 0:
@@ -727,65 +857,52 @@ def spatial_cv_evaluate(X, y, fit_idx, grid_labels, R, beta, params, num_round,
         dva = xgb.DMatrix(X[va_pts], label=y[va_pts])
         bst_ce = _xgb_train_es(params, dtr, num_round, dva, early_stop)
         p_ce_full = bst_ce.predict(dX)                   # 全栅格预测
+        fold_ce[f] = p_ce_full
         soft_f = soft_labels_8nn(p_ce_full.reshape(n, n), R, beta).ravel()
         delta_f = gate_frozen(p_ce_full)
         y_te = y[test_pts]
         p_ce_te = p_ce_full[test_pts]
-        # SR(λ=1.0)：固定强度
-        obj = make_asr_objective(delta_f[tr_pts], soft_f[tr_pts], 1.0)
-        bst = _xgb_train_es(params, dtr, num_round, dva, early_stop, obj=obj)
-        p_sr10_te = predict_prob(bst, dX)[test_pts]
-        # ASR：训练侧预选 λ*（逐像元，公平版）
-        obj = make_asr_objective(delta_f[tr_pts], soft_f[tr_pts],
-                                 lam_map[tr_pts])
-        bst = _xgb_train_es(params, dtr, num_round, dva, early_stop, obj=obj)
-        p_asr_te = predict_prob(bst, dX)[test_pts]
-        per_fold['CE'].append((brier_score(y_te, p_ce_te),
-                               auc_score(y_te, p_ce_te),
-                               logloss_score(y_te, p_ce_te),
-                               recall_score(y_te, p_ce_te)))
-        per_fold['SR(λ=1.0)'].append((brier_score(y_te, p_sr10_te),
-                                      auc_score(y_te, p_sr10_te),
-                                      logloss_score(y_te, p_sr10_te),
-                                      recall_score(y_te, p_sr10_te)))
-        per_fold['ASR'].append((brier_score(y_te, p_asr_te),
-                                auc_score(y_te, p_asr_te),
-                                logloss_score(y_te, p_asr_te),
-                                recall_score(y_te, p_asr_te)))
-        # band 内指标（按该折 CE 预测分层；fold-avg 口径，供论文表8）
-        for bname, lo, hi in STRATA_BANDS:
-            msk = np.ones(len(y_te), bool)
-            if lo is not None:
-                msk &= (p_ce_te >= lo)
-            if hi is not None:
-                msk &= (p_ce_te <= hi)
-            if int(msk.sum()) == 0:
-                continue
-            yb = y_te[msk]
-            band_fold[('CE', bname)].append((brier_score(yb, p_ce_te[msk]),
-                                             auc_score(yb, p_ce_te[msk]),
-                                             logloss_score(yb, p_ce_te[msk]),
-                                             recall_score(yb, p_ce_te[msk])))
-            band_fold[('SR(λ=1.0)', bname)].append((brier_score(yb, p_sr10_te[msk]),
-                                                     auc_score(yb, p_sr10_te[msk]),
-                                                     logloss_score(yb, p_sr10_te[msk]),
-                                                     recall_score(yb, p_sr10_te[msk])))
-            band_fold[('ASR', bname)].append((brier_score(yb, p_asr_te[msk]),
-                                              auc_score(yb, p_asr_te[msk]),
-                                              logloss_score(yb, p_asr_te[msk]),
-                                              recall_score(yb, p_asr_te[msk])))
+        for a in arms:
+            if a['type'] == 'ce':
+                p_te = p_ce_te                       # CE：直接用折内 CE 预测
+            elif a['type'] == 'sr':                  # SR：固定强度
+                obj = make_asr_objective(delta_f[tr_pts], soft_f[tr_pts], a['lam'])
+                bst = _xgb_train_es(params, dtr, num_round, dva, early_stop, obj=obj)
+                p_te = predict_prob(bst, dX)[test_pts]
+            else:                                    # ASR：训练侧预选 λ*（逐像元，公平版）
+                obj = make_asr_objective(delta_f[tr_pts], soft_f[tr_pts],
+                                         lam_map[tr_pts])
+                bst = _xgb_train_es(params, dtr, num_round, dva, early_stop, obj=obj)
+                p_te = predict_prob(bst, dX)[test_pts]
+            per_fold[a['disp']].append((brier_score(y_te, p_te),
+                                        auc_score(y_te, p_te),
+                                        logloss_score(y_te, p_te),
+                                        recall_score(y_te, p_te)))
+            # band 内指标（按该折 CE 预测分层；fold-avg 口径，供论文表8）
+            for bname, lo, hi in STRATA_BANDS:
+                msk = np.ones(len(y_te), bool)
+                if lo is not None:
+                    msk &= (p_ce_te >= lo)
+                if hi is not None:
+                    msk &= (p_ce_te <= hi)
+                if int(msk.sum()) == 0:
+                    continue
+                yb = y_te[msk]
+                band_fold[(a['disp'], bname)].append(
+                    (brier_score(yb, p_te[msk]), auc_score(yb, p_te[msk]),
+                     logloss_score(yb, p_te[msk]), recall_score(yb, p_te[msk])))
+            pts[a['disp']].append(p_te)
         pts['y'].append(y_te)
-        pts['CE'].append(p_ce_te)
-        pts['SR'].append(p_sr10_te)
-        pts['ASR'].append(p_asr_te)
         pts['lam'].append(lam_map[test_pts])
-    return per_fold, pts, band_fold
+    return per_fold, pts, band_fold, fold_ce
 
 
 # ==========================================================================
 # 6. 主流程
 # ==========================================================================
-CACHE_VERSION = 'v4'   # 缓存结构版本（v4: cv_bands 每折 band 内指标，fold-avg 口径）；改结构需递增
+CACHE_VERSION = 'v5'   # v5: 臂级增量缓存——条目存训练状态(state)+折内CE预测(fold_ce)，
+                       # test/cv/cv_bands/pts 一律以臂显示名(disp)为键；加新臂只补算缺失臂，
+                       # 不重跑数据生成/CE基线/软标签/分块λ*选择/折内CE。改结构需递增
 def main():
     ap = argparse.ArgumentParser(description='ASR-XGBoost minimal demo')
     ap.add_argument('--beta', type=float, default=2.0)
@@ -840,6 +957,21 @@ def main():
         run_study(args, lam_grid)
         return
 
+    # ---------- 自定义分块（--blocks）：尺寸/内容校验，网格自动对齐 ----------
+    custom_blocks = None
+    if args.blocks:
+        custom_blocks = np.load(args.blocks)
+        if custom_blocks.ndim != 2 or custom_blocks.shape[0] != custom_blocks.shape[1]:
+            raise SystemExit(f'[错误] regions.npy 应为方阵 n×n，实际为 {tuple(custom_blocks.shape)}')
+        nb = int(custom_blocks.shape[0])
+        if nb != args.grid:
+            print(f'[提示] regions.npy 为 {nb}×{nb}，已将 --grid 由 {args.grid} 自动调整为 {nb}'
+                  f'（分块尺寸必须与模拟网格一致）')
+            args.grid = nb
+        if (custom_blocks < 0).all():
+            raise SystemExit('[错误] regions.npy 里没有任何区域（全为 -1）。请先用 draw_regions.py\n'
+                             '       圈出区域（需图形界面），或去掉 --blocks 使用默认分块。')
+
     # ---------- 单次详细演示 ----------
     # demo 缓存：同参数直接读缓存，跳过训练与空间 CV（--no-cache 强制重跑）
     demo_cache_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -878,7 +1010,7 @@ def main():
                             dict(objective='binary:logistic', eta=0.1, max_depth=4,
                                  subsample=0.8, colsample_bytree=0.8, seed=args.seed),
                             args.num_round, args.cv_rounds, args.cv_folds,
-                            custom_blocks=(np.load(args.blocks) if args.blocks else None),
+                            custom_blocks=custom_blocks,
                             verbose=True, split=split, sample_frac=args.sample,
                             early_stop=args.early_stop)
         n = out['n']
@@ -886,14 +1018,14 @@ def main():
         # 每折重训 CE 并重算软标签/门控（无泄漏）；ASR 用训练侧预选 λ*（公平版）。
         print('>> final 式空间 CV 评估（3×3 网格块折）…', flush=True)
         glab = grid_blocks(n, 3).ravel()
-        per_fold, _, _ = spatial_cv_evaluate(out['Xall'], out['y'], out['trva'], glab,
-                                          out['R'], args.beta,
-                                          dict(objective='binary:logistic', eta=0.1,
-                                               max_depth=4, subsample=0.8,
-                                               colsample_bytree=0.8, seed=args.seed),
-                                          args.num_round, out['lam_map'],
-                                          n_folds=args.cv_folds,
-                                          early_stop=args.early_stop)
+        per_fold, _, _, _ = spatial_cv_evaluate(out['Xall'], out['y'], out['trva'], glab,
+                                               out['R'], args.beta,
+                                               dict(objective='binary:logistic', eta=0.1,
+                                                    max_depth=4, subsample=0.8,
+                                                    colsample_bytree=0.8, seed=args.seed),
+                                               args.num_round, out['lam_map'],
+                                               n_folds=args.cv_folds,
+                                               early_stop=args.early_stop)
         # 写缓存（轻量字段，不含训练大对象）
         dcache[demo_key] = _demo_cache_entry(out, per_fold)
         try:
@@ -914,7 +1046,7 @@ def main():
           f'{args.sample:.0%} 采样）| 训练 {n_tr} | 验证 {n_va} | 测试 {n_te}（{args.split}）')
     print(f'数据生成: {GENERATIONS[args.gen]["name"]} | 分块: {PARTITIONS["p_voronoi"]} | '
           f'块数 {out["n_blocks"]}')
-    print(f'超参数: β={args.beta}  λ_global=1.0  λ_grid={lam_grid}  seed={args.seed}')
+    print(f'超参数: β={args.beta}  λ*: 逐块选择（候选 lam_grid={lam_grid}，块内 CV + 1-SE）  seed={args.seed}')
     print(f'分块自适应 λ*（块内 {args.cv_folds} 折 CV，1-SE 规则）:')
     for b, npx, star, mb, ma in out['cv_rows']:
         print(f'  块 {b}: 像元 {npx:5d}  λ* = {star:>4}  (CV Brier {mb:.4f} / AUC {ma:.4f})')
@@ -926,13 +1058,13 @@ def main():
     print('=' * 66)
 
     print(f'空间 CV（3×3 网格块折，{args.cv_folds} 折，mean±std，唯一评估方式）:')
-    print(_row(['指标', 'CE', 'SR(λ=1.0)', 'ASR'], [14, 18, 18, 18]))
+    print(_row(['指标'] + ARMS_DISP, [14] + [18] * len(ARMS_DISP)))
     for mname, idx in [('AUC', 1), ('Brier', 0), ('Recall', 3)]:
         vals_by_m = []
-        for m in ('CE', 'SR(λ=1.0)', 'ASR'):
+        for m in ARMS_DISP:
             vals = [x[idx] for x in per_fold[m]]
             vals_by_m.append(f'{np.mean(vals):.4f}±{np.std(vals):.4f}')
-        print(_row([mname] + vals_by_m, [14, 18, 18, 18]))
+        print(_row([mname] + vals_by_m, [14] + [18] * len(ARMS_DISP)))
     print('=' * 66)
 
     # 出图（2×3 六联图：真值/分块+λ*/CE + ASR/差值/校准；差值图放大差距，海洋显示为灰色）
@@ -970,9 +1102,10 @@ def main():
         kw = dict(origin='lower', vmin=vrange[0], vmax=vrange[1]) if vrange else dict(origin='lower')
         kw['interpolation'] = 'bilinear'   # 低分辨率栅格放大平滑
         im = ax.imshow(data, cmap=cmap, **kw)
-        ax.set_title(title, fontsize=12)
+        ax.set_title(title, fontsize=15)
         ax.set_xticks([]); ax.set_yticks([])
-        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        _cb = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        _cb.ax.tick_params(labelsize=12)
 
     # ---- Blocks & λ* 面板（λ 渐变背景 + 块边界线） ----
     ax_bl = axes[0, 1]
@@ -983,9 +1116,11 @@ def main():
     ax_bl.contour(labels2d,
                   levels=np.arange(-0.5, int(labels2d.max()) + 1, 1.0),
                   colors='black', linewidths=0.7)
-    ax_bl.set_title('Blocks & λ*', fontsize=12)
+    ax_bl.set_title('Blocks & λ*', fontsize=15)
     ax_bl.set_xticks([]); ax_bl.set_yticks([])
-    fig.colorbar(im_bl, ax=ax_bl, fraction=0.046, pad=0.04, label='λ')
+    _cb = fig.colorbar(im_bl, ax=ax_bl, fraction=0.046, pad=0.04, label='λ')
+    _cb.set_label('λ', fontsize=14)
+    _cb.ax.tick_params(labelsize=12)
 
     # ---- 校准曲线面板（CE vs ASR，测试集，等宽 10 箱 + 对角线） ----
     ax_cal = axes[0, 2]
@@ -999,11 +1134,12 @@ def main():
         mp, of = calibration_curve(y_te, p_arr, n_bins=10)
         ax_cal.plot(mp, of, marker + '-', color=color, lw=1.2, ms=4,
                     label=lab, markevery=1)
-    ax_cal.set_title('Calibration curve', fontsize=12)
-    ax_cal.set_xlabel('Mean predicted probability', fontsize=10)
-    ax_cal.set_ylabel('Observed frequency', fontsize=10)
+    ax_cal.set_title('Calibration curve', fontsize=15)
+    ax_cal.set_xlabel('Mean predicted probability', fontsize=14)
+    ax_cal.set_ylabel('Observed frequency', fontsize=14)
+    ax_cal.tick_params(axis='both', labelsize=12)
     ax_cal.set_xlim(0, 1); ax_cal.set_ylim(0, 1)
-    ax_cal.legend(fontsize=9, loc='upper left')
+    ax_cal.legend(fontsize=12, loc='upper left')
 
     fig.tight_layout()
     fig.savefig('demo_result.png', dpi=140)
@@ -1011,13 +1147,17 @@ def main():
 
 
 def _cache_entry(out):
-    """提取聚合所需字段做缓存（不含 Xall/R/soft 等训练用大对象）。"""
+    """提取聚合所需字段做缓存。
+
+    v5 起额外保存训练状态(state)与每折 CE 全栅格预测(fold_ce)：
+    以后加新臂时用它们只补算缺失臂（见 _add_missing_arms），免全量重跑。"""
     return dict(gname=out['gname'], pname=out['pname'], seed=out['seed'],
                 n_blocks=out['n_blocks'], lam_star=out['lam_star'], n=out['n'],
                 test=out['test'], cv=out['cv'], cv_pts=out['cv_pts'],
                 cv_bands=out['cv_bands'],
                 te=out['te'], y=out['y'], p_ce=out['p_ce'],
-                p_asr_b=out['p_asr_b'], lam_map=out['lam_map'])
+                p_asr_b=out['p_asr_b'], lam_map=out['lam_map'],
+                state=out['state'], fold_ce=out['fold_ce'])
 
 
 def _demo_cache_entry(out, per_fold):
@@ -1038,7 +1178,9 @@ def _demo_cache_entry(out, per_fold):
 
 def run_study(args, lam_grid):
     """多情形模拟研究：生成方式 × 分块方式 × 重复种子 → 平均精度。
-    逐模拟缓存（study_cache.pkl，key 含全部相关参数；--no-cache 强制重跑）。"""
+    逐模拟缓存（study_cache_<版本>.pkl，key 含全部相关参数；--no-cache 强制重跑）。
+    臂级增量：缓存条目缺 ARMS 中某臂（如新加 SR(λ=3.5)）时只补算该臂，
+    不重跑数据生成/CE/软标签/分块 λ* 选择/折内 CE。"""
     gens = args.gens.split(',')
     parts = args.parts.split(',')
     split = tuple(float(v) for v in args.split.split(','))
@@ -1046,7 +1188,7 @@ def run_study(args, lam_grid):
     params = dict(objective='binary:logistic', eta=0.1, max_depth=4,
                   subsample=0.8, colsample_bytree=0.8, seed=args.seed)
     cache_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                              'study_cache.pkl')
+                              f'study_cache_{CACHE_VERSION}.pkl')
     cache = {}
     if not args.no_cache and os.path.exists(cache_path):
         try:
@@ -1070,10 +1212,27 @@ def run_study(args, lam_grid):
                        f'{args.min_pixels}|{",".join(map(str, lam_grid))}|'
                        f'{args.beta}|{args.cv_folds}|'
                        f'{args.sample}|{",".join(map(str, split))}')
-                if key in cache:
-                    out = cache[key]
-                    cached = True
-                else:
+                out = cache.get(key)
+                if out is not None:
+                    missing = _missing_arms(out)
+                    if missing and _can_add_arms(out):
+                        # 增量：只补算缺失臂（测试划分 + 空间CV 每折），不动昂贵部分
+                        out = _add_missing_arms(out, missing, params, args)
+                        cache[key] = _cache_entry(out)
+                        cached = '增量补臂(' + ','.join(a['disp'] for a in missing) + ')'
+                        if not args.no_cache:
+                            try:
+                                with open(cache_path, 'wb') as f:
+                                    pickle.dump(cache, f)
+                            except Exception:
+                                print('[Cache] 写盘失败（继续，内存中保留）', flush=True)
+                    elif missing:
+                        out = None      # 旧条目无训练状态 → 走整体重跑
+                        cached = '重跑'
+                    else:
+                        cached = '缓存'
+                if out is None:
+                    cached = '重跑'
                     out = simulate_once(gname, pname, seed, n, args.study_nblocks,
                                         args.min_pixels, lam_grid, args.beta,
                                         params, args.num_round, args.cv_rounds,
@@ -1082,22 +1241,22 @@ def run_study(args, lam_grid):
                                         early_stop=args.early_stop)
                     # final 式空间 CV（3×3 网格块折，每折重训+重算软标签，无泄漏）
                     glab = grid_blocks(out['n'], 3).ravel()
-                    pf, pts, bf = spatial_cv_evaluate(out['Xall'], out['y'], out['trva'], glab,
-                                                      out['R'], args.beta, params,
-                                                      args.num_round,
-                                                      out['lam_map'],
-                                                      n_folds=args.cv_folds,
-                                                      early_stop=args.early_stop)
+                    pf, pts, bf, fold_ce = spatial_cv_evaluate(
+                        out['Xall'], out['y'], out['trva'], glab,
+                        out['R'], args.beta, params,
+                        args.num_round, out['lam_map'],
+                        n_folds=args.cv_folds, early_stop=args.early_stop,
+                        arms=ARMS)
+                    out['fold_ce'] = fold_ce
                     out['cv'] = {m: np.asarray(pf[m]).mean(axis=0)
-                                 for m in ('CE', 'SR(λ=1.0)', 'ASR')}
+                                 for m in ARMS_DISP}
                     out['cv_bands'] = {m: {
                         bname: (np.asarray(bf[(m, bname)]).mean(axis=0)
                                 if bf[(m, bname)] else (np.nan,) * 4)
                         for bname, _, _ in STRATA_BANDS}
-                        for m in ('CE', 'SR(λ=1.0)', 'ASR')}
+                        for m in ARMS_DISP}
                     out['cv_pts'] = {k: np.concatenate(v) for k, v in pts.items()}
                     cache[key] = _cache_entry(out)
-                    cached = False
                     # 逐条写盘：中断后重跑可断点续跑（已完成的模拟直接命中）
                     if not args.no_cache:
                         try:
@@ -1107,8 +1266,7 @@ def run_study(args, lam_grid):
                             print('[Cache] 写盘失败（继续，内存中保留）', flush=True)
                 results.append(out)
                 i += 1
-                print(f'[{i}/{total}] {gname} × {pname} × seed={seed} '
-                      f'({"缓存" if cached else "重跑"}) '
+                print(f'[{i}/{total}] {gname} × {pname} × seed={seed} ({cached}) '
                       f'(λ* 范围 {min(out["lam_star"].values())}~'
                       f'{max(out["lam_star"].values())})', flush=True)
     if not args.no_cache:
@@ -1116,37 +1274,36 @@ def run_study(args, lam_grid):
             pickle.dump(cache, f)
         print(f'[Cache] 已写入 {len(cache)} 条缓存: {cache_path}')
 
-    # 汇总：测试集指标 + final 式空间 CV（mean±std）
-    disp = {'CE': 'CE', 'ASRg': 'SR(λ=1.0)', 'ASRb': 'ASR'}
-    cv_models = ('CE', 'SR(λ=1.0)', 'ASR')
+    # 汇总：测试集指标 + final 式空间 CV（mean±std）；列 = ARMS 各臂
     print('=' * 74)
     print(f'模拟研究汇总：{len(gens)} 种数据生成 × {len(parts)} 种分块 × '
           f'{args.reps} 个种子 = {len(results)} 次模拟（跨次平均，等效重复实验）')
     print('-' * 74)
+    _w = [14] + [18] * len(ARMS_DISP)
     print('测试集指标（7:2:1 划分，ASR 用训练侧分块 λ*；mean±std）:')
-    print(_row(['指标', 'CE', 'SR(λ=1.0)', 'ASR'], [14, 18, 18, 18]))
+    print(_row(['指标'] + ARMS_DISP, _w))
     agg = {}
     for mname, idx in [('AUC', 0), ('Brier', 1), ('Recall', 6),
                        ("Moran's I", 2), ('Cont. ed.', 3), ('Iso ratio', 4)]:
         vals_by_m = []
-        for m in ('CE', 'ASRg', 'ASRb'):
+        for m in ARMS_DISP:
             vals = [r['test'][m][idx] for r in results]
-            agg.setdefault(disp[m], {})[mname] = np.asarray(vals)
+            agg.setdefault(m, {})[mname] = np.asarray(vals)
             vals_by_m.append(f'{np.mean(vals):.4f}±{np.std(vals):.4f}')
-        print(_row([mname] + vals_by_m, [14, 18, 18, 18]))
+        print(_row([mname] + vals_by_m, _w))
     print('-' * 74)
     _asr_note = 'ASR 用训练侧预选 λ*（公平版）'
     print('空间 CV（3×3 网格块折，块不跨折，每折重训+重算软标签，'
           f'{_asr_note}；mean±std）:')
-    print(_row(['指标', 'CE', 'SR(λ=1.0)', 'ASR'], [14, 18, 18, 18]))
+    print(_row(['指标'] + ARMS_DISP, _w))
     cv_agg = {}
     for mname, idx in [('AUC', 1), ('Brier', 0), ('Recall', 3)]:
         vals_by_m = []
-        for m in cv_models:
+        for m in ARMS_DISP:
             vals = [r['cv'][m][idx] for r in results]
             cv_agg.setdefault(m, {})[mname] = np.asarray(vals)
             vals_by_m.append(f'{np.mean(vals):.4f}±{np.std(vals):.4f}')
-        print(_row([mname] + vals_by_m, [14, 18, 18, 18]))
+        print(_row([mname] + vals_by_m, _w))
     print('-' * 74)
     for mname in ('AUC', 'Brier', 'Recall', "Moran's I", 'Cont. ed.', 'Iso ratio'):
         d = np.mean(agg['ASR'][mname] - agg['CE'][mname])
@@ -1295,7 +1452,7 @@ def run_study(args, lam_grid):
     print(f'配对显著性（每模拟 Δ = ASR − CE；配对 t 与 Wilcoxon 符号秩，n={len(results)}）:')
     for src, key, mlist, asr_key in (
             ('测试集', 'test', [('AUC', 0), ('Brier', 1), ('Recall', 6),
-                                ("Moran's I", 2), ('Cont. ed.', 3), ('Iso ratio', 4)], 'ASRb'),
+                                ("Moran's I", 2), ('Cont. ed.', 3), ('Iso ratio', 4)], 'ASR'),
             ('空间CV', 'cv', [('AUC', 1), ('Brier', 0), ('Recall', 3)], 'ASR')):
         for mname, idx in mlist:
             d = np.array([r[key][asr_key][idx] - r[key]['CE'][idx] for r in results])
@@ -1307,42 +1464,45 @@ def run_study(args, lam_grid):
             print(f'  {src} {mname:<8} Δ{np.mean(d):+.4f}±{np.std(d):.4f}  '
                   f't={t:+.2f} p={p:.4f}  Wilcoxon p={wp:.4f}')
     print('-' * 74)
+    _wc = [24] + [20] * len(ARMS_DISP)
     print('按 生成×分块 组合（跨种子平均 AUC / Brier，测试集）:')
-    print(_row(['组合', 'CE', 'SR(λ=1.0)', 'ASR'], [22, 22, 22, 22]))
+    print(_row(['组合'] + ARMS_DISP, _wc))
     for gname in gens:
         for pname in parts:
             rs = [r for r in results if r['gname'] == gname and r['pname'] == pname]
             cells = [f'{gname}×{pname}']
-            for m in ('CE', 'ASRg', 'ASRb'):
+            for m in ARMS_DISP:
                 a = np.mean([r['test'][m][0] for r in rs])
                 b = np.mean([r['test'][m][1] for r in rs])
                 cells.append(f'{a:.4f}/{b:.4f}')
-            print(_row(cells, [22, 22, 22, 22]))
+            print(_row(cells, _wc))
     print('-' * 74)
     print('按 生成×分块 组合（跨种子平均 AUC / Brier，空间CV）:')
-    print(_row(['组合', 'CE', 'SR(λ=1.0)', 'ASR'], [22, 22, 22, 22]))
+    print(_row(['组合'] + ARMS_DISP, _wc))
     for gname in gens:
         for pname in parts:
             rs = [r for r in results if r['gname'] == gname and r['pname'] == pname]
             cells = [f'{gname}×{pname}']
-            for m in cv_models:
+            for m in ARMS_DISP:
                 a = np.mean([r['cv'][m][1] for r in rs])
                 b = np.mean([r['cv'][m][0] for r in rs])
                 cells.append(f'{a:.4f}/{b:.4f}')
-            print(_row(cells, [22, 22, 22, 22]))
+            print(_row(cells, _wc))
     print('-' * 74)
-    print(f'按 生成 分档精度（跨 3 分块 × {args.reps} 种子；每格 CE / SR(λ=1.0) / ASR）:')
+    print(f'按 生成 分档精度（跨 3 分块 × {args.reps} 种子；'
+          f'每格 {" / ".join(ARMS_DISP)}）:')
     cols = [('AUC(CV)', 'cv', 1), ('Brier(CV)', 'cv', 0), ('Recall(CV)', 'cv', 3),
             ('Recall(test)', 'test', 6), ("Moran's I(test)", 'test', 2),
             ('Cont. ed.(test)', 'test', 3), ('Iso(test)', 'test', 4)]
-    print(_row(['生成'] + [c[0] for c in cols], [10, 18, 18, 18, 18, 18, 18, 18]))
+    _wg = [12] + [22] * len(ARMS_DISP)
+    print(_row(['生成'] + [c[0] for c in cols], [12] + [22] * len(cols)))
     for gname in gens:
         rs = [r for r in results if r['gname'] == gname]
         cells = [gname]
         for col, key, idx in cols:
-            ms = ('CE', 'SR(λ=1.0)', 'ASR') if key == 'cv' else ('CE', 'ASRg', 'ASRb')
-            cells.append('/'.join(f'{np.mean([r[key][m][idx] for r in rs]):.4f}' for m in ms))
-        print(_row(cells, [10, 18, 18, 18, 18, 18, 18, 18]))
+            cells.append('/'.join(f'{np.mean([r[key][m][idx] for r in rs]):.4f}'
+                                  for m in ARMS_DISP))
+        print(_row(cells, [12] + [22] * len(cols)))
     print('-' * 74)
     # λ* 选择分布（训练侧块内 CV，对应行政 λ 选择口径）
     from collections import Counter

@@ -20,10 +20,18 @@
     - 需要图形界面（Windows 上直接运行即可；无显示环境请用默认块）。
 """
 import argparse
+import sys
 import numpy as np
+import matplotlib
 import matplotlib.pyplot as plt
 from matplotlib.path import Path
 from asr_demo import gen_landscape, GENERATIONS
+
+
+def _interactive_backend():
+    """判断当前 matplotlib 后端是否能弹窗交互（无显示环境会退到非交互式 Agg）。"""
+    b = matplotlib.get_backend().lower()
+    return ('agg' not in b) or ('nbagg' in b) or ('ipympl' in b) or ('widget' in b)
 
 
 def main():
@@ -31,6 +39,11 @@ def main():
     ap.add_argument('--grid', type=int, default=200)
     ap.add_argument('--seed', type=int, default=42)
     args = ap.parse_args()
+    if not _interactive_backend():
+        print(f'[错误] 当前 matplotlib 后端是 "{matplotlib.get_backend()}"，是非交互式的，无法用鼠标圈区域。')
+        print('       请在带图形界面的环境运行（Windows/macOS 直接跑；或设 MPLBACKEND=TkAgg）；')
+        print('       无图形界面时请去掉 --blocks，直接用 asr_demo.py 的默认分块。')
+        sys.exit(1)
     n = args.grid
     rng = np.random.default_rng(args.seed)
     _, _, _, _, p_true, _ = gen_landscape(n, rng, GENERATIONS['g_clean'])
@@ -92,6 +105,9 @@ def main():
     plt.show()
 
     n_regions = len(np.unique(labels)) - (1 if -1 in np.unique(labels) else 0)
+    if n_regions == 0:
+        print('[警告] 未圈出任何区域（0 块），未保存 regions.npy。')
+        sys.exit(1)
     np.save('regions.npy', labels)
     print(f'已保存 regions.npy（{n}×{n}，圈出 {n_regions} 块区域）')
     print('运行: python asr_demo.py --blocks regions.npy')

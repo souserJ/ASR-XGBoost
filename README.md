@@ -56,7 +56,7 @@ python asr_demo.py --study --gens g_hard      # hard only: weak signal + high no
 python asr_demo.py --study --reps 10   # formal protocol (16 blocks / min-pixels 150 are the defaults), paired significance (recommended)
 python asr_demo.py --study --reps 3           # increase number of seeds
 python asr_demo.py --study --no-cache         # ignore cache, force full rerun
-python asr_demo.py --blocks regions.npy     # use your own drawn regions (single-run mode)
+python asr_demo.py --blocks regions.npy     # use your own drawn regions (single-run mode; the grid size is taken from regions.npy automatically)
 ```
 
 **Draw your own regions** (Windows GUI):
@@ -66,6 +66,7 @@ python draw_regions.py
 # left-click: add point | right-click: close a block | c: undo | q: save and exit
 python asr_demo.py --blocks regions.npy
 ```
+> Note: `--grid` follows the size of `regions.npy` automatically (e.g. 200×200); if you pass a conflicting `--grid` it is adjusted with a notice. `draw_regions.py` needs an interactive display and refuses to run headlessly.
 
 ## Simulation Study (--study)
 
@@ -74,7 +75,8 @@ Design: default **three difficulty levels (g_clean / g_mid / g_hard) × 3 block 
 - Data generators (by difficulty): `g_clean` (**easy**: low noise) / `g_mid` (**medium**: full-block σ≈0.23 moderate noise) / `g_hard` (**hard**: weak signal logit×0.45 + σ≈0.36, CE predictions largely near 0.5, amplifying the ASR gating gain); other generators: `g_noisy` (high block-level noise heterogeneity) / `g_noisy2` (full-block high noise) / `g_barrier` (strong terrain barrier) / `g_lgcp` (point-process LGCP)
 - Block partitions: `p_voronoi` (Voronoi random "country" blocks) / `p_grid` (regular grid blocks, corresponding to the 5°×5° grid convention) / `p_resist` (ecological resistance partitions)
 - Output: per-simulation progress (cache/rerun markers) → test-set summary table → spatial CV summary table → mean improvement → subset gains → paired significance (per-simulation Δ = ASR−CE, paired t + Wilcoxon) → generator × partition combination table (test set + spatial CV) → λ\* selection distribution
-- **Cache**: per-simulation results stored in `study_cache.pkl` (keys include all parameters; parameter changes invalidate automatically); reruns hit the cache in seconds; `--no-cache` forces a full rerun
+- **Cache**: per-simulation results stored in `study_cache_<CACHE_VERSION>.pkl` (keys include all parameters; parameter changes invalidate automatically); reruns hit the cache in seconds; `--no-cache` forces a full rerun
+- **Arm-level incremental cache (v5+)**: each cached entry stores the training state (data, splits, soft labels/gating, per-block λ\*, per-fold CE predictions). Adding a new model arm = add one entry to the `ARMS` registry (e.g. `dict(key='SRg35', disp='SR(λ=3.5)', type='sr', lam=3.5)`), then rerun the same `--study` command: cached simulations are re-used and only the missing arm is trained (test partition once + one model per spatial-CV fold), without re-running data generation, the CE baseline, soft labels, or the per-block λ\* search. Default arms match the paper protocol: CE, `SR(λ=1.0)`, ASR. A diagnostic `SR(λ=3.0)` arm was evaluated (2026-09-07, cached): under this symmetric-noise smooth-field design it systematically beats ASR — the gating already performs most per-pixel adaptation and the 1-SE λ selection is conservative — so it is kept out of the paper's simulation table but can be restored with one registry line.
 
 Example output (formal protocol: **16 blocks / min-pixels 150**; 3 difficulties × 3 partitions × 10 seeds = 90 simulations, both test-set and spatial-CV protocols):
 

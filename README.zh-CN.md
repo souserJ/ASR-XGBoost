@@ -54,7 +54,7 @@ python asr_demo.py --study --gens g_hard      # 只跑困难：弱信号 + 高�
 python asr_demo.py --study --reps 10   # 正式口径（16 块 / min-pixels 150 已是默认值），三档全跑，配对显著性（推荐）
 python asr_demo.py --study --reps 3           # 增加重复种子数
 python asr_demo.py --study --no-cache         # 忽略缓存，强制全部重跑
-python asr_demo.py --blocks regions.npy     # 用自己圈的区域（单次模式）
+python asr_demo.py --blocks regions.npy     # 用自己圈的区域（单次模式；网格尺寸自动跟随 regions.npy）
 ```
 
 **自己圈区域**（Windows 图形界面）：
@@ -64,6 +64,7 @@ python draw_regions.py
 # 左键加点 | 右键闭合一块 | c 撤销 | q 保存退出
 python asr_demo.py --blocks regions.npy
 ```
+> 注：`--grid` 会自动跟随 `regions.npy` 的尺寸（如 200×200）；若显式传入冲突的 `--grid`，会提示后自动对齐。`draw_regions.py` 需要交互式图形界面，无显示环境下会直接报错退出。
 
 ## 模拟研究（--study）
 
