@@ -40,6 +40,13 @@ $$
 | File | Description |
 |---|---|
 | `asr_demo.py` | Main script: single detailed demo + `--study` multi-scenario simulation study |
+| `asr_demo_modified.py` | Copy of `asr_demo.py` that adds the non-stationary and heterogeneous-detection generators used by the ADEMP study |
+| `asr_ademp.py` | ADEMP-protocol simulation runner (outer folds, inner-fold strength selection, CE / SR(λ=1) / SRcv / ASR) |
+| `asr_demo_coast.py` | Copy of `asr_demo_modified.py` that adds the land/sea geometry factor `COASTS` |
+| `asr_ademp_coast.py` | ADEMP runner with the `--coast` and `--coast-pairing` factors |
+| `make_sim_figure.py` | Reproduces the simulation figure of the paper (reads an ADEMP run, writes `figures/ademp_sim_demo.png`) |
+| `ADEMP_README.md`, `ADEMP_COAST_README.md` | Protocol and usage notes for the two ADEMP runners |
+| `test_asr_ademp.py` | Pytest validity checks for the ADEMP protocol (held-out-label isolation, inner early-stopping isolation, λ=0 equivalence, spatial-group isolation, no wrapping neighbourhood, paired MCSE) |
 | `draw_regions.py` | Interactive region-drawing script (mouse polygon), outputs `regions.npy` |
 | `requirements.txt` | numpy / xgboost / matplotlib / gstools |
 
@@ -76,7 +83,7 @@ Design: default **three difficulty levels (g_clean / g_mid / g_hard) × 3 block 
 - Block partitions: `p_voronoi` (Voronoi random "country" blocks) / `p_grid` (regular grid blocks, corresponding to the 5°×5° grid convention) / `p_resist` (ecological resistance partitions)
 - Output: per-simulation progress (cache/rerun markers) → test-set summary table → spatial CV summary table → mean improvement → subset gains → paired significance (per-simulation Δ = ASR−CE, paired t + Wilcoxon) → generator × partition combination table (test set + spatial CV) → λ\* selection distribution
 - **Cache**: per-simulation results stored in `study_cache_<CACHE_VERSION>.pkl` (keys include all parameters; parameter changes invalidate automatically); reruns hit the cache in seconds; `--no-cache` forces a full rerun
-- **Arm-level incremental cache (v5+)**: each cached entry stores the training state (data, splits, soft labels/gating, per-block λ\*, per-fold CE predictions). Adding a new model arm = add one entry to the `ARMS` registry (e.g. `dict(key='SRg35', disp='SR(λ=3.5)', type='sr', lam=3.5)`), then rerun the same `--study` command: cached simulations are re-used and only the missing arm is trained (test partition once + one model per spatial-CV fold), without re-running data generation, the CE baseline, soft labels, or the per-block λ\* search. Default arms match the paper protocol: CE, `SR(λ=1.0)`, ASR. A diagnostic `SR(λ=3.0)` arm was evaluated (2026-09-07, cached): under this symmetric-noise smooth-field design it systematically beats ASR — the gating already performs most per-pixel adaptation and the 1-SE λ selection is conservative — so it is kept out of the paper's simulation table but can be restored with one registry line.
+- **Arm-level incremental cache (v5+)**: each cached entry stores the training state (data, splits, soft labels/gating, per-block λ\*, per-fold CE predictions). Adding a new model arm = add one entry to the `ARMS` registry (e.g. `dict(key='SRg35', disp='SR(λ=3.5)', type='sr', lam=3.5)`), then rerun the same `--study` command: cached simulations are re-used and only the missing arm is trained (test partition once + one model per spatial-CV fold), without re-running data generation, the CE baseline, soft labels, or the per-block λ\* search. Default arms match the paper protocol: CE, `SR(λ=1.0)`, ASR. Diagnostic arms with a stronger fixed strength, and a globally tuned strength chosen by inner cross-validation (`SRcv`), were also evaluated. Under this symmetric-noise smooth-field design the tuned global strength performs on a par with block-wise adaptation, and a fixed `SR(λ=3.0)` arm tends to exceed both. The gains over the CE baseline are therefore attributable to embedding spatial continuity in the training objective rather than to the block-wise selection itself, which instead sets the strength from the data. These comparisons are reported in the ADEMP study described below.
 
 Example output (formal protocol: **16 blocks / min-pixels 150**; 3 difficulties × 3 partitions × 10 seeds = 90 simulations, both test-set and spatial-CV protocols):
 
@@ -120,6 +127,47 @@ spatial metrics (Moran's I / ContED / Iso ratio, consistent with the paper) impr
 (isolated-pixel ratio drops 17.1 percentage points in the hard setting); gating-band gains
 CE∈[0.4,0.6] are ~3.5–5× the global gain (test ΔAUC 0.0252 vs 0.0050; spatial CV 0.0210 vs 0.0060,
 validating the gating design); λ* adapts to data difficulty (means 1.25 / 1.44 / 2.18).
+
+## ADEMP simulation study (`asr_ademp.py`)
+
+`asr_demo.py --study` is the release demo. `asr_ademp.py` is a stricter, self-contained study that follows the ADEMP reporting structure (Aim, Data-generating mechanism, Estimands, Methods, Performance measures) and forms the basis of the simulation results reported in the paper. `ADEMP_README.md` gives the full protocol.
+
+- Entry point: `python asr_ademp.py --gens g_clean,g_mid,g_hard,g_nonstationary,g_detection --parts p_grid --reps 20 --out results/ademp_<tag>`
+- Comparison arms: `CE`, `SR(λ=1)` (fixed strength), `SRcv` (single global strength chosen by inner cross-validation), `ASR` (block-wise adaptive strengths). The manuscript's simulation section reports the CE-versus-ASR contrast, while the `SR(λ=1)` and `SRcv` arms remain available as additional comparisons.
+- Evaluation: three outer folds, so every sampled pixel is predicted once by a model that did not see it; inner three-fold cross-validation for strength selection; early stopping on an internal 15% split; two protocols, random-pixel folds and spatial-block folds. Outer held-out labels never enter fitting, early stopping or strength selection, and no cache is read from the demo.
+- Observed output (5 scenarios × 20 repetitions × 2 protocols):
+
+```
+ASR - CE (AUC):     +0.003 to +0.007 (significant in 4 of 5 scenarios under random-pixel folds,
+                    and in the low-noise, medium-noise and non-stationary scenarios under spatial-block folds)
+ASR - CE (Brier):   -0.0008 to -0.0020 (all five scenarios under random-pixel folds)
+ASR - CE (MSE against the true suitability): -0.0012 to -0.0025 in the four informative scenarios
+ASR - SRcv (pooled): ΔAUC -0.0008 (p = 0.06), ΔBrier +0.0003 (p = 0.016)
+Within-band rank correlation with the true field: +0.029 in the p_true in [0.4,0.6] band,
+                                                   +0.107 in the CE in [0.4,0.6] band
+```
+
+- What the study shows: spatial regularization generally improves on the CE baseline, with weaker or uncertain effects under spatial validation in the weak-signal and heterogeneous-detection settings. A globally tuned strength performs on a par with block-wise adaptation; the experiment therefore does not establish a consistent additional accuracy benefit from regional adaptation. The CE-defined probability-band analysis is exploratory because selecting pixels by the CE prediction restricts the CE range but not the ASR range. Under heterogeneous detection, prediction of observed labels and recovery of latent suitability are distinct targets because the reporting probability is left unmodelled.
+- Block fallback: a block contributes its own strength only with at least two inner scoring folds and at least 30 scoring samples, and otherwise inherits the global value. The share of inherited blocks ranged from 0% on the land-only grid to 57% on the archipelago, which limits how far the adaptive mechanism itself is exercised.
+- Paper figure: two steps, then the PNG lands in `figures/ademp_sim_demo.png`.
+
+```bash
+python asr_ademp.py --gens g_mid --parts p_voronoi --validation random \
+    --reps 1 --sample 1.0 --out results/figure_pvoronoi
+python make_sim_figure.py            # defaults to results/figure_pvoronoi, g_mid, rep 0, p_voronoi, random
+```
+
+Repeated runs never overwrite each other. If the output directory already exists, `asr_ademp.py`
+appends `-1`, `-2` and so on, and `make_sim_figure.py` then picks the most recent run that predicts
+every land pixel, so a stale or partially sampled run is not picked up by accident.
+
+The figure is a qualitative illustration from one repetition. Every number quoted in the paper comes from the aggregated tables of a separate, larger ADEMP run (`summary.csv`, `paired.csv`, `diagnostics.csv`).
+
+## Coast (land and sea geometry) factor (`asr_ademp_coast.py`)
+
+`asr_demo_coast.py` and `asr_ademp_coast.py` add land and sea geometry as an explicit robustness factor, `coast in {vertical, horizontal, archipelago, none}`, where `vertical` reproduces the original coastline exactly. By default the four levels share the same random-number streams within a repetition (`--coast-pairing shared`). The resulting conditions are nevertheless not an isolated causal contrast of coastline shape: the masks change the available land pixels and sample size and can change generated regions and the observation process. `--coast-pairing independent` draws separate streams. Outputs go to `results/coast_<timestamp>` and never overwrite an existing directory.
+
+Repeating the low-noise, medium-noise and non-stationary scenarios across four land--sea configurations produced qualitatively similar ASR - CE contrasts. This is a robustness check over the tested configurations, not evidence for an isolated coastline effect or invariance to arbitrary geography. `ADEMP_COAST_README.md` gives the design limitations.
 
 ## About This Repository (Demo Positioning)
 

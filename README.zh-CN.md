@@ -38,6 +38,13 @@ $$
 | 文件 | 说明 |
 |---|---|
 | `asr_demo.py` | 主脚本：单次详细演示 + `--study` 多情形模拟研究 |
+| `asr_demo_modified.py` | `asr_demo.py` 的副本，新增非平稳与检测异质性两个数据生成器（供 ADEMP 研究使用） |
+| `asr_ademp.py` | ADEMP 口径模拟运行器（外层折留出、内层折选强度，对照 CE / SR(λ=1) / SRcv / ASR） |
+| `asr_demo_coast.py` | `asr_demo_modified.py` 的副本，新增海陆几何因子 `COASTS` |
+| `asr_ademp_coast.py` | 带 `--coast` / `--coast-pairing` 因子的 ADEMP 运行器 |
+| `make_sim_figure.py` | 复现论文模拟示意图（读 ADEMP 输出，写到 `figures/ademp_sim_demo.png`） |
+| `ADEMP_README.md`、`ADEMP_COAST_README.md` | 两个 ADEMP 运行器的协议与用法说明 |
+| `test_asr_ademp.py` | ADEMP 协议有效性检查（pytest：留出标签隔离、内层早停隔离、λ=0 一致性、空间组隔离、无环绕邻域、配对 MCSE） |
 | `draw_regions.py` | 交互式圈定区域脚本（鼠标画多边形），输出 `regions.npy` |
 | `requirements.txt` | numpy / xgboost / matplotlib / gstools |
 
@@ -73,7 +80,8 @@ python asr_demo.py --blocks regions.npy
 - 数据生成（按难度分档）：`g_clean`（**简单**：低噪声）/ `g_mid`（**中等**：全块 σ≈0.23 中等噪声）/ `g_hard`（**困难**：弱信号 logit×0.45 + σ≈0.36，CE 预测大量接近 0.5，放大 ASR 门控收益）；其他生成器：`g_noisy`（高块间噪声异质性）/ `g_noisy2`（全块高噪声）/ `g_barrier`（强地形屏障）/ `g_lgcp`（点过程 LGCP）
 - 分块方式：`p_voronoi`（Voronoi 随机国家块）/ `p_grid`（规则网格块，对应 5°×5° 网格惯例）/ `p_resist`（生态阻力分区）
 - 输出：逐次模拟进度（缓存/重跑标记）→ 测试集汇总表 → 空间 CV 汇总表 → 平均改善 → 子集增益 → 配对显著性（每模拟 Δ = ASR−CE，配对 t + Wilcoxon）→ 按 生成×分块 组合表（测试集 + 空间CV）→ λ\* 选择分布
-- **缓存**：逐模拟结果存 `study_cache.pkl`（key 含全部参数，改参数自动失效）；二次运行命中缓存秒出；`--no-cache` 强制重跑
+- **缓存**：逐模拟结果存 `study_cache_<CACHE_VERSION>.pkl`（key 含全部参数，改参数自动失效）；二次运行命中缓存秒出；`--no-cache` 强制重跑
+- **臂级增量缓存（v5+）**：每个缓存条目保存训练状态（数据、划分、软标签/门控、分块 λ\*、逐折 CE 预测）。新增一个模型臂 = 在 `ARMS` 注册表加一条（如 `dict(key='SRg35', disp='SR(λ=3.5)', type='sr', lam=3.5)`），再用同一条 `--study` 命令重跑：已缓存模拟直接复用，只补训缺失的臂（测试分区一次 + 每个空间 CV 折一次），不重跑数据生成、CE 基线、软标签或分块 λ\* 搜索。默认臂与论文口径一致：CE、`SR(λ=1.0)`、ASR。另评估了更强固定强度的诊断臂，以及由内层交叉验证选出的全局强度（`SRcv`）。在这种对称噪声、光滑场的设计下，调好的全局强度与分块自适应大体相当，而固定 `SR(λ=3.0)` 臂往往超过两者。因此相对 CE 的增益应归于把空间连续性写入训练目标，而不是分块选择本身（分块只负责从数据里定强度）。这些对照在下面的 ADEMP 研究中给出。
 
 示例输出（正式口径：**16 块 / min-pixels 150**；三档难度 × 3 分块 × 10 种子 = 90 次模拟，测试集 + 空间 CV 双口径）：
 
@@ -117,6 +125,44 @@ Iso ratio，与论文口径一致）全面改善（困难档孤立像元比例�
 门控带 CE∈[0.4,0.6] 增益约为全局 3.5~5 倍（测试集 ΔAUC 0.0252 vs 0.0050；
 空间CV 0.0210 vs 0.0060，验证门控设计）；λ* 随数据难度自适应（均值
 1.25 / 1.44 / 2.18）。
+
+## ADEMP 模拟研究（`asr_ademp.py`）
+
+`asr_demo.py --study` 是公开发布用的演示。`asr_ademp.py` 是更严格、独立的模拟研究，按 ADEMP 报告框架组织（Aim / Data-generating mechanism / Estimands / Methods / Performance measures），也是论文中模拟结果的来源。完整协议见 `ADEMP_README.md`。
+
+- 运行：`python asr_ademp.py --gens g_clean,g_mid,g_hard,g_nonstationary,g_detection --parts p_grid --reps 20 --out results/ademp_<tag>`
+- 对照臂：`CE`、`SR(λ=1)`（固定强度）、`SRcv`（内层交叉验证选的单一全局强度）、`ASR`（分块自适应强度）；论文正文的模拟一节报告的是 CE 与 ASR 的对照，`SR(λ=1)` 与 `SRcv` 作为额外对照臂保留在代码中。
+- 评估：3 个外层折，每个被采样像元恰好被一个没见过它的模型预测一次；强度由内层 3 折交叉验证选择；早停用内部 15% 划分；两种协议（随机像元折 / 空间块折）。外层留出标签不参与拟合、早停与强度选择；不读演示的缓存。
+- 已观测结果（5 场景 × 20 重复 × 2 协议）：
+
+```
+ASR − CE（AUC）：+0.003 ~ +0.007（随机像元折下 5 个场景中 4 个显著；空间块折下低噪/中噪/非平稳显著）
+ASR − CE（Brier）：−0.0008 ~ −0.0020（随机像元折下 5 个场景全部显著）
+ASR − CE（相对真实适宜性的 MSE）：4 个有信号场景下降 0.0012 ~ 0.0025
+ASR − SRcv（合并）：ΔAUC −0.0008（p = 0.06），ΔBrier +0.0003（p = 0.016）
+带内与真实场的秩相关：p_true ∈ [0.4,0.6] 带内 +0.029；CE ∈ [0.4,0.6] 带内 +0.107
+```
+
+- 结论：空间正则化总体上优于 CE，但在弱信号和检测异质性场景的空间验证中，部分差异较弱或不确定。内层交叉验证调好的**全局强度与分块自适应大体相当**，因此本实验尚未证明区域自适应具有稳定的额外精度收益。由 CE 预测定义的概率带分析属于探索性定位分析，因为该筛选限制了 CE 的取值范围，却没有同样限制 ASR。检测异质性场景中，预测观测标签与恢复潜在适宜性是两个不同目标，因为报告概率没有被建模。
+- 分块回退：一个块只有在至少 2 个内层评分折且至少 30 个评分样本时才给出自己的强度，否则沿用全局值。回退块占比在 0%（全陆地）到 57%（群岛）之间，这限制了自适应机制本身被检验的程度。
+- 论文示意图：两步即可，PNG 写到 `figures/ademp_sim_demo.png`。
+
+```bash
+python asr_ademp.py --gens g_mid --parts p_voronoi --validation random \
+    --reps 1 --sample 1.0 --out results/figure_pvoronoi
+python make_sim_figure.py            # 默认就用 results/figure_pvoronoi，g_mid，rep 0，p_voronoi，random
+```
+
+重复运行不会互相覆盖。若输出目录已存在，`asr_ademp.py` 会自动加后缀 `-1`、`-2`；
+`make_sim_figure.py` 则自动挑**最近一次且陆地覆盖完整**的那份 run，避免误用旧的或采样不全的数据。
+
+该图是单次重复的定性示意；论文里引用的所有数字都来自另跑的大规模 ADEMP 结果表（`summary.csv` / `paired.csv` / `diagnostics.csv`）。
+
+## 海岸（海陆几何）因子（`asr_ademp_coast.py`）
+
+`asr_demo_coast.py` 与 `asr_ademp_coast.py` 将海陆几何作为稳健性因子 `coast ∈ {vertical, horizontal, archipelago, none}`，其中 `vertical` 与原海岸线逐像元一致。默认同一重复下四个水平共用随机数流（`--coast-pairing shared`）。但这些条件不是海岸形状的独立因果对照：掩膜会改变陆地像元数、样本量，也可能改变生成分区和观测过程。`--coast-pairing independent` 则各自抽取随机流。输出写到 `results/coast_<时间戳>`，不覆盖已有目录。
+
+把低噪、中噪、非平稳三个场景在四种海陆构型下重跑后，ASR − CE 的结果方向总体相近。这说明主要结论在已测试构型下具有定性稳健性，但不能证明对任意地理结构不变，也不能解释为海岸形状的独立效应。细节见 `ADEMP_COAST_README.md`。
 
 ## 关于本仓库（演示版定位）
 
